@@ -1,0 +1,2 @@
+# yadict
+Yet Another Dict.

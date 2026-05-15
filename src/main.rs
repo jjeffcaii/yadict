@@ -37,6 +37,9 @@ enum Commands {
         /// HTTP(S) URL of the .mdx file to download
         url: String,
     },
+
+    /// List all installed dictionaries in ~/.yadict/mdicts/
+    List,
 }
 
 /// URL-keyed disk cache. Index is stored in `~/.yadict/cache.tsv` (tab-separated: url\tabsolute_path).
@@ -197,6 +200,23 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Add { url } => {
             download_to_cache(&url)?;
+        }
+        Commands::List => {
+            let mdicts_dir = yadict_home()?.join("mdicts");
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&mdicts_dir)
+                .map_err(|e| anyhow!("Cannot read {}: {e}", mdicts_dir.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "mdx"))
+                .collect();
+            paths.sort();
+            if paths.is_empty() {
+                println!("No dictionaries installed. Use 'yadict add <URL>' to install one.");
+            } else {
+                for path in &paths {
+                    println!("{}", path.file_name().unwrap_or_default().to_string_lossy());
+                }
+            }
         }
         Commands::Translate { word } => {
             let mdicts_dir = yadict_home()?.join("mdicts");

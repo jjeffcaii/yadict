@@ -19,6 +19,9 @@ ratatui = "0.30.0"
 clap = { version = "4", features = ["derive"] }
 bytes = "1.11.1"
 minilzo-rs = "0.6.0"
+html2text = "0.14"
+ureq = { version = "2", features = ["tls"] }
+termimad = "0.30"
 
 [dev-dependencies]
 pretty_env_logger = "0.5"

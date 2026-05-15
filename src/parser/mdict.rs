@@ -1,7 +1,6 @@
 use memmap2::Mmap;
 use nom::{IResult, bytes::complete::take_till};
 use std::cell::OnceCell;
-use std::cmp::Ordering;
 
 use super::parser::{BlockEntryInfo, KeyBlock, KeyEntry, record_block_parser};
 
@@ -64,7 +63,7 @@ impl Mdx {
         let mut block_offset = 0;
         let mut buf_offset = 0;
         for i in &self.records_info {
-            if entry_offset <= block_offset + i.decompressed_size {
+            if entry_offset < block_offset + i.decompressed_size {
                 return Some(RecordOffset {
                     buf_offset,
                     block_offset: entry_offset - block_offset,
@@ -85,31 +84,33 @@ impl Mdx {
     {
         let key = key.as_ref().to_lowercase();
 
-        let found = self
-            .key_blocks
-            .binary_search_by(|probe| {
-                let begin = String::from_utf8_lossy(probe.first_key().unwrap()).to_lowercase();
-                let end = String::from_utf8_lossy(probe.last_key().unwrap()).to_lowercase();
+        // MDict dictionaries sort punctuated forms (e.g. "cat-", "cat.") before the bare
+        // headword ("cat"). When such a form is a block's first_key, standard string
+        // comparison ("cat-" > "cat") causes binary_search_by to skip that block entirely.
+        //
+        // Instead, use partition_point to find the insertion index, then probe both the
+        // block just before the insertion point (normal case) and the block AT the insertion
+        // point (edge case: its first_key is a punctuated variant of our key). The entry-
+        // level search is a linear scan, so checking one extra block is cheap.
+        let pos = self.key_blocks.partition_point(|probe| {
+            let begin = String::from_utf8_lossy(probe.first_key().unwrap()).to_lowercase();
+            begin.as_str() <= key.as_str()
+        });
 
-                if &begin > &key {
-                    Ordering::Greater
-                } else if &key > &end {
-                    Ordering::Less
-                } else {
-                    Ordering::Equal
+        for idx in [pos.wrapping_sub(1), pos] {
+            if let Some(block) = self.key_blocks.get(idx) {
+                if let Some(entry) = block.get(&key) {
+                    return Some(Record {
+                        key: entry.text,
+                        mdx: self,
+                        entry_offset: entry.offset,
+                        cache: OnceCell::new(),
+                    });
                 }
-            })
-            .ok()?;
+            }
+        }
 
-        let block = &self.key_blocks[found];
-
-        let entry = block.get(&key)?;
-        Some(Record {
-            key: entry.text,
-            mdx: self,
-            entry_offset: entry.offset,
-            cache: OnceCell::new(),
-        })
+        None
     }
 
     fn fetch_definition(&self, entry_offset: usize) -> Option<Vec<u8>> {

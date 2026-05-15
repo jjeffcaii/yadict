@@ -1,22 +1,22 @@
 use std::{collections::HashMap, io::Read, path::Path, str};
 
 use adler32::adler32;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use memmap2::Mmap;
 
-use encoding::{Encoding, all::UTF_16LE};
+use encoding::{all::UTF_16LE, Encoding};
 use flate2::read::ZlibDecoder;
 use nom::{
-    IResult, Slice,
-    bytes::complete::{take, take_till},
-    combinator::map,
+    bytes::complete::{take, take_till}, combinator::map,
     multi::{count, length_data, many0},
-    number::complete::{be_u8, be_u16, be_u32, be_u64, le_u32},
+    number::complete::{be_u16, be_u32, be_u64, be_u8, le_u32},
     sequence::tuple,
+    IResult,
+    Slice,
 };
 use regex::Regex;
 use ripemd::{Digest, Ripemd128};
-use salsa20::{Salsa20, cipher::KeyIvInit};
+use salsa20::{cipher::KeyIvInit, Salsa20};
 
 use super::mdict::Mdx;
 
@@ -69,19 +69,16 @@ impl KeyBlock {
 
     pub(crate) fn get(&self, key: &str) -> Option<KeyEntry<'_>> {
         let key = key.to_lowercase();
-
-        let idx = self
-            .entries
-            .binary_search_by(|e| {
-                let raw = &self.data[e.text_start..e.text_start + e.text_len];
-                let probe = String::from_utf8_lossy(raw).to_lowercase();
-                debug!("probe: {}", probe);
-                probe.cmp(&key)
-            })
-            .ok()?;
-
-        let entry = &self.entries[idx];
-        Some(KeyEntry {
+        // MDict dictionaries use a collation where combining forms (e.g. "cat-") and
+        // abbreviations (e.g. "cat.") sort before the bare headword ("cat"), which is
+        // the opposite of Rust's standard string ordering. Binary search would therefore
+        // miss entries whose neighbours differ only in a trailing punctuation character.
+        // A linear scan over the block (typically a few hundred to a few thousand entries)
+        // is both correct and fast enough for interactive use.
+        self.entries.iter().find(|e| {
+            let raw = &self.data[e.text_start..e.text_start + e.text_len];
+            String::from_utf8_lossy(raw).to_lowercase() == key
+        }).map(|entry| KeyEntry {
             offset: entry.offset,
             text: &self.data[entry.text_start..entry.text_start + entry.text_len],
         })
@@ -123,7 +120,7 @@ fn parse_header(input: &[u8]) -> Result<(&[u8], Header)> {
     let (input, (info, chksum)) = tuple((length_data(be_u32), le_u32))(input).map_err(ne)?;
 
     if adler32(info)? != chksum {
-        return Err(anyhow!("header checksum mismatch"));
+        bail!("header checksum mismatch");
     }
 
     let info = UTF_16LE

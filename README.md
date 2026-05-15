@@ -41,6 +41,20 @@ Downloading https://example.com/oxford.mdx ...
 Saved to /Users/you/.yadict/mdicts/oxford.mdx
 ```
 
+### List installed dictionaries
+
+```bash
+yadict list
+```
+
+Lists all `.mdx` files currently installed in `~/.yadict/mdicts/`.
+
+```
+$ yadict list
+collins.mdx
+oxford.mdx
+```
+
 ## Data directory
 
 By default, yadict stores dictionaries and cache under `~/.yadict/`. Set the `YADICT_HOME` environment variable to use a different location:

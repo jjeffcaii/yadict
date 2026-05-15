@@ -1,5 +1,7 @@
 # yadict
 
+![yadict](logo.jpg)
+
 A fast command-line MDict (`.mdx`) dictionary lookup tool with terminal color rendering.
 
 ## Installation

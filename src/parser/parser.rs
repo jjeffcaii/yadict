@@ -1,22 +1,22 @@
 use std::{collections::HashMap, io::Read, path::Path, str};
 
 use adler32::adler32;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use memmap2::Mmap;
 
-use encoding::{all::UTF_16LE, Encoding};
+use encoding::{Encoding, all::UTF_16LE};
 use flate2::read::ZlibDecoder;
 use nom::{
-    bytes::complete::{take, take_till}, combinator::map,
+    IResult, Slice,
+    bytes::complete::{take, take_till},
+    combinator::map,
     multi::{count, length_data, many0},
-    number::complete::{be_u16, be_u32, be_u64, be_u8, le_u32},
+    number::complete::{be_u8, be_u16, be_u32, be_u64, le_u32},
     sequence::tuple,
-    IResult,
-    Slice,
 };
 use regex::Regex;
 use ripemd::{Digest, Ripemd128};
-use salsa20::{cipher::KeyIvInit, Salsa20};
+use salsa20::{Salsa20, cipher::KeyIvInit};
 
 use super::mdict::Mdx;
 
@@ -78,13 +78,18 @@ impl KeyBlock {
         // Exact case match: the caller is responsible for passing the key in the desired
         // case. Block-level navigation uses lowercase for range checks; entry-level
         // matching here is case-sensitive so "cat" does not return "CAT".
-        self.entries.iter().find(|e| {
-            let raw = &self.data[e.text_start..e.text_start + e.text_len];
-            String::from_utf8_lossy(raw) == key
-        }).map(|entry| KeyEntry {
-            offset: entry.offset,
-            text: &self.data[entry.text_start..entry.text_start + entry.text_len],
-        })
+        self.entries
+            .iter()
+            .find(|e| {
+                let probe =
+                    String::from_utf8_lossy(&self.data[e.text_start..e.text_start + e.text_len]);
+                debug!("probe={}, key={}", probe, key);
+                &probe == key
+            })
+            .map(|entry| KeyEntry {
+                offset: entry.offset,
+                text: &self.data[entry.text_start..entry.text_start + entry.text_len],
+            })
     }
 }
 

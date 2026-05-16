@@ -1,8 +1,9 @@
+use super::parser::{BlockEntryInfo, KeyBlock, KeyEntry, record_block_parser};
+use crate::lang::compare as icu_compare;
 use memmap2::Mmap;
 use nom::{IResult, bytes::complete::take_till};
 use std::cell::OnceCell;
-
-use super::parser::{BlockEntryInfo, KeyBlock, KeyEntry, record_block_parser};
+use std::cmp::Ordering;
 
 #[derive(Debug)]
 struct RecordOffset {
@@ -83,10 +84,6 @@ impl Mdx {
         A: AsRef<str>,
     {
         let key = key.as_ref();
-        // Lowercase is used only for block-level range navigation (partition_point).
-        // Entry-level matching in KeyBlock::get uses the original case so that "cat"
-        // does not match "CAT" or vice-versa.
-        let lower_key = key.to_lowercase();
 
         // MDict dictionaries sort punctuated forms (e.g. "cat-", "cat.") before the bare
         // headword ("cat"). When such a form is a block's first_key, standard string
@@ -94,12 +91,17 @@ impl Mdx {
         //
         // Instead, use partition_point to find the insertion index, then probe both the
         // block just before the insertion point (normal case) and the block AT the insertion
-        // point (edge case: its first_key is a punctuated variant of our key). The entry-
-        // level search is a linear scan, so checking one extra block is cheap.
-        let pos = self.key_blocks.partition_point(|probe| {
-            let begin = String::from_utf8_lossy(probe.first_key().unwrap()).to_lowercase();
-            begin.as_str() <= lower_key.as_str()
-        });
+        // point (edge case: its first_key is a punctuated variant of our key). The entry-level
+        // search is a linear scan, so checking one extra block is cheap.
+        let pos = self
+            .key_blocks
+            .partition_point(|probe| match probe.last_key() {
+                None => false,
+                Some(b) => match icu_compare(&String::from_utf8_lossy(b), key) {
+                    Ordering::Less => true,
+                    _ => false,
+                },
+            });
 
         for idx in [pos.wrapping_sub(1), pos] {
             if let Some(block) = self.key_blocks.get(idx) {

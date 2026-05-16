@@ -22,6 +22,8 @@ minilzo-rs = "0.6.0"
 html2text = "0.14"
 ureq = { version = "2", features = ["tls"] }
 termimad = "0.30"
+icu = { version = "1.5", features = ["compiled_data"] }
+whatlang = "0.16" # 极其轻量、高效的语言检测库
 
 [dev-dependencies]
 pretty_env_logger = "0.5"

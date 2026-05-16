@@ -16,10 +16,9 @@ mod tests {
     fn test_query() -> anyhow::Result<()> {
         init();
 
-        let dict = parse("/Users/jeffsky/Downloads/col.mdx")?;
-        // let dict = parse("/Users/jeffsky/Downloads/简明汉英词典.mdx")?;
+        let dict = parse("/Users/jeffsky/.yadict/mdicts/英汉大词典（第二版）陆谷孙.mdx")?;
 
-        let result = dict.get("apple");
+        let result = dict.get("bird");
 
         assert!(result.is_some());
 

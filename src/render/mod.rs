@@ -1,7 +1,7 @@
 use anyhow::Result;
 use termimad::{
-    crossterm::style::{Attribute, Color},
     MadSkin, StyledChar,
+    crossterm::style::{Attribute, Color},
 };
 
 pub trait Render {

@@ -12,5 +12,6 @@ extern crate anyhow;
 extern crate log;
 
 pub mod dicts;
+pub mod lang;
 pub mod parser;
 pub mod render;

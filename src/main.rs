@@ -160,10 +160,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < src.len() {
         if src[i] == b'%' && i + 2 < src.len() {
-            if let Ok(b) = u8::from_str_radix(
-                std::str::from_utf8(&src[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&src[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 buf.push(b);
                 i += 3;
                 continue;
@@ -174,7 +173,6 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8(buf).unwrap_or_else(|_| s.to_string())
 }
-
 
 fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var("HOME")
@@ -230,7 +228,10 @@ fn main() -> anyhow::Result<()> {
             paths.sort();
 
             if paths.is_empty() {
-                eprintln!("No dictionaries found in {}. Use 'yadict add <URL>' to install one.", mdicts_dir.display());
+                eprintln!(
+                    "No dictionaries found in {}. Use 'yadict add <URL>' to install one.",
+                    mdicts_dir.display()
+                );
                 return Ok(());
             }
 

@@ -82,7 +82,11 @@ impl Mdx {
     where
         A: AsRef<str>,
     {
-        let key = key.as_ref().to_lowercase();
+        let key = key.as_ref();
+        // Lowercase is used only for block-level range navigation (partition_point).
+        // Entry-level matching in KeyBlock::get uses the original case so that "cat"
+        // does not match "CAT" or vice-versa.
+        let lower_key = key.to_lowercase();
 
         // MDict dictionaries sort punctuated forms (e.g. "cat-", "cat.") before the bare
         // headword ("cat"). When such a form is a block's first_key, standard string
@@ -94,12 +98,12 @@ impl Mdx {
         // level search is a linear scan, so checking one extra block is cheap.
         let pos = self.key_blocks.partition_point(|probe| {
             let begin = String::from_utf8_lossy(probe.first_key().unwrap()).to_lowercase();
-            begin.as_str() <= key.as_str()
+            begin.as_str() <= lower_key.as_str()
         });
 
         for idx in [pos.wrapping_sub(1), pos] {
             if let Some(block) = self.key_blocks.get(idx) {
-                if let Some(entry) = block.get(&key) {
+                if let Some(entry) = block.get(key) {
                     return Some(Record {
                         key: entry.text,
                         mdx: self,

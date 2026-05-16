@@ -68,16 +68,19 @@ impl KeyBlock {
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<KeyEntry<'_>> {
-        let key = key.to_lowercase();
         // MDict dictionaries use a collation where combining forms (e.g. "cat-") and
         // abbreviations (e.g. "cat.") sort before the bare headword ("cat"), which is
         // the opposite of Rust's standard string ordering. Binary search would therefore
         // miss entries whose neighbours differ only in a trailing punctuation character.
         // A linear scan over the block (typically a few hundred to a few thousand entries)
         // is both correct and fast enough for interactive use.
+        //
+        // Exact case match: the caller is responsible for passing the key in the desired
+        // case. Block-level navigation uses lowercase for range checks; entry-level
+        // matching here is case-sensitive so "cat" does not return "CAT".
         self.entries.iter().find(|e| {
             let raw = &self.data[e.text_start..e.text_start + e.text_len];
-            String::from_utf8_lossy(raw).to_lowercase() == key
+            String::from_utf8_lossy(raw) == key
         }).map(|entry| KeyEntry {
             offset: entry.offset,
             text: &self.data[entry.text_start..entry.text_start + entry.text_len],

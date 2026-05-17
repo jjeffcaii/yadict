@@ -6,10 +6,9 @@
 #![allow(clippy::module_inception)]
 
 #[macro_use]
-extern crate log;
-
-#[macro_use]
 extern crate anyhow;
+#[macro_use]
+extern crate log;
 
 use std::path::PathBuf;
 
@@ -246,7 +245,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                if let Some(record) = mdx.get(&word) {
+                for record in mdx.lookup(&word) {
                     if let Some(bytes) = record.value() {
                         let value = String::from_utf8_lossy(bytes);
                         results.push(default_render.render(value)?);

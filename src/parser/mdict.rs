@@ -4,6 +4,7 @@ use memmap2::Mmap;
 use nom::{IResult, bytes::complete::take_till};
 use std::cell::OnceCell;
 use std::cmp::Ordering;
+use std::fmt::Display;
 
 #[derive(Debug)]
 struct RecordOffset {
@@ -44,6 +45,18 @@ pub struct Mdx {
     pub encrypted: u8,
 }
 
+impl Display for Mdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for next in &self.key_blocks {
+            let first = next.first_key().map(|b| String::from_utf8_lossy(b));
+            let last = next.last_key().map(|b| String::from_utf8_lossy(b));
+            write!(f, "{:?}~{:?}\n", &first, &last)?;
+        }
+
+        Ok(())
+    }
+}
+
 impl Mdx {
     pub fn items(&self) -> impl Iterator<Item = Record<'_>> + '_ {
         self.key_blocks.iter().flat_map(|block| {
@@ -79,7 +92,7 @@ impl Mdx {
         None
     }
 
-    pub fn get<A>(&self, key: A) -> Option<Record<'_>>
+    pub fn lookup<A>(&self, key: A) -> Vec<Record<'_>>
     where
         A: AsRef<str>,
     {
@@ -97,26 +110,39 @@ impl Mdx {
             .key_blocks
             .partition_point(|probe| match probe.last_key() {
                 None => false,
-                Some(b) => match icu_compare(&String::from_utf8_lossy(b), key) {
-                    Ordering::Less => true,
-                    _ => false,
-                },
+                Some(b) => {
+                    let end = &String::from_utf8_lossy(b);
+                    let ordering = icu_compare(&end, key);
+                    debug!("probe={}, key={}, result={:?}", &end, key, ordering);
+                    match ordering {
+                        Ordering::Less => true,
+                        _ => false,
+                    }
+                }
             });
+
+        debug!("pos: {}", pos);
 
         for idx in [pos.wrapping_sub(1), pos] {
             if let Some(block) = self.key_blocks.get(idx) {
-                if let Some(entry) = block.get(key) {
-                    return Some(Record {
+                let entries = block.lookup(key);
+                if entries.is_empty() {
+                    continue;
+                }
+
+                return entries
+                    .iter()
+                    .map(|entry| Record {
                         key: entry.text,
                         mdx: self,
                         entry_offset: entry.offset,
                         cache: OnceCell::new(),
-                    });
-                }
+                    })
+                    .collect();
             }
         }
 
-        None
+        vec![]
     }
 
     fn fetch_definition(&self, entry_offset: usize) -> Option<Vec<u8>> {

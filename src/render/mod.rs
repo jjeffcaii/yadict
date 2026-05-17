@@ -2,8 +2,8 @@ use anyhow::Result;
 use regex::Regex;
 use std::sync::LazyLock;
 use termimad::{
-    crossterm::style::{Attribute, Color},
     MadSkin, StyledChar,
+    crossterm::style::{Attribute, Color},
 };
 
 pub trait Render {
@@ -16,48 +16,98 @@ pub struct DefaultRender;
 // Matches " N." (space + one-or-more digits + dot).
 // The caller checks that the character after the dot is not a digit, so
 // decimal numbers like " 1.5" are excluded without needing lookahead.
-static INLINE_NUM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r" \d+\.").unwrap());
+static INLINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" \d+\.").unwrap());
 
 fn build_skin() -> MadSkin {
     let mut skin = MadSkin::default();
 
     // H1: bright gold + underline — primary headword
-    skin.headers[0].compound_style.set_fg(Color::Rgb { r: 255, g: 215, b: 0 });
+    skin.headers[0].compound_style.set_fg(Color::Rgb {
+        r: 255,
+        g: 215,
+        b: 0,
+    });
     skin.headers[0].compound_style.add_attr(Attribute::Bold);
-    skin.headers[0].compound_style.add_attr(Attribute::Underlined);
+    skin.headers[0]
+        .compound_style
+        .add_attr(Attribute::Underlined);
 
     // H2: coral orange — POS / section header
-    skin.headers[1].compound_style.set_fg(Color::Rgb { r: 255, g: 110, b: 60 });
+    skin.headers[1].compound_style.set_fg(Color::Rgb {
+        r: 255,
+        g: 110,
+        b: 60,
+    });
     skin.headers[1].compound_style.add_attr(Attribute::Bold);
 
     // H3: warm yellow — sub-section
-    skin.headers[2].compound_style.set_fg(Color::Rgb { r: 230, g: 200, b: 70 });
+    skin.headers[2].compound_style.set_fg(Color::Rgb {
+        r: 230,
+        g: 200,
+        b: 70,
+    });
     skin.headers[2].compound_style.add_attr(Attribute::Bold);
 
     // H4–H6: soft lavender
     for h in &mut skin.headers[3..] {
-        h.compound_style.set_fg(Color::Rgb { r: 180, g: 155, b: 230 });
+        h.compound_style.set_fg(Color::Rgb {
+            r: 180,
+            g: 155,
+            b: 230,
+        });
     }
 
     // Italic (phonetics, example sentences): sky cyan
-    skin.italic.set_fg(Color::Rgb { r: 80, g: 210, b: 235 });
+    skin.italic.set_fg(Color::Rgb {
+        r: 80,
+        g: 210,
+        b: 235,
+    });
 
     // Bold (emphasis, POS labels): warm peach
-    skin.bold.set_fg(Color::Rgb { r: 255, g: 200, b: 120 });
+    skin.bold.set_fg(Color::Rgb {
+        r: 255,
+        g: 200,
+        b: 120,
+    });
     skin.bold.add_attr(Attribute::Bold);
 
     // Inline code: mint green
-    skin.inline_code.set_fg(Color::Rgb { r: 80, g: 220, b: 140 });
+    skin.inline_code.set_fg(Color::Rgb {
+        r: 80,
+        g: 220,
+        b: 140,
+    });
 
     // Bullet marker: sky blue ›
-    skin.bullet = StyledChar::from_fg_char(Color::Rgb { r: 60, g: 180, b: 255 }, '›');
+    skin.bullet = StyledChar::from_fg_char(
+        Color::Rgb {
+            r: 60,
+            g: 180,
+            b: 255,
+        },
+        '›',
+    );
 
     // Block-quote bar: soft indigo │
-    skin.quote_mark = StyledChar::from_fg_char(Color::Rgb { r: 120, g: 100, b: 220 }, '│');
+    skin.quote_mark = StyledChar::from_fg_char(
+        Color::Rgb {
+            r: 120,
+            g: 100,
+            b: 220,
+        },
+        '│',
+    );
 
     // Horizontal rule: dim grey ─
-    skin.horizontal_rule = StyledChar::from_fg_char(Color::Rgb { r: 70, g: 70, b: 80 }, '─');
+    skin.horizontal_rule = StyledChar::from_fg_char(
+        Color::Rgb {
+            r: 70,
+            g: 70,
+            b: 80,
+        },
+        '─',
+    );
 
     skin
 }
@@ -157,8 +207,14 @@ fn normalize_lists(md: &str) -> String {
 fn is_numbered_md_item(s: &str) -> bool {
     let n = s.bytes().take_while(|b| b.is_ascii_digit()).count();
     n > 0
-        && s.as_bytes().get(n).copied().map_or(false, |b| b == b'.' || b == b')')
-        && s.as_bytes().get(n + 1).copied().map_or(false, |b| b == b' ')
+        && s.as_bytes()
+            .get(n)
+            .copied()
+            .map_or(false, |b| b == b'.' || b == b')')
+        && s.as_bytes()
+            .get(n + 1)
+            .copied()
+            .map_or(false, |b| b == b' ')
 }
 
 impl Render for DefaultRender {

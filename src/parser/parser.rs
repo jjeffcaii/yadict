@@ -67,7 +67,7 @@ impl KeyBlock {
             .map(|e| &self.data[e.text_start..e.text_start + e.text_len])
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<KeyEntry<'_>> {
+    pub(crate) fn lookup(&self, key: &str) -> Vec<KeyEntry<'_>> {
         // MDict dictionaries use a collation where combining forms (e.g. "cat-") and
         // abbreviations (e.g. "cat.") sort before the bare headword ("cat"), which is
         // the opposite of Rust's standard string ordering. Binary search would therefore
@@ -80,7 +80,7 @@ impl KeyBlock {
         // matching here is case-sensitive so "cat" does not return "CAT".
         self.entries
             .iter()
-            .find(|e| {
+            .filter(|e| {
                 let probe =
                     String::from_utf8_lossy(&self.data[e.text_start..e.text_start + e.text_len]);
                 debug!("probe={}, key={}", probe, key);
@@ -90,6 +90,7 @@ impl KeyBlock {
                 offset: entry.offset,
                 text: &self.data[entry.text_start..entry.text_start + entry.text_len],
             })
+            .collect()
     }
 }
 

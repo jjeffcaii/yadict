@@ -13,7 +13,21 @@ extern crate log;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    style::{Color, ResetColor, SetForegroundColor},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color as TuiColor, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Terminal,
+};
 use yadict::parser;
+use yadict::registry::{DictEntry, MdictOrgRegistry, Registry};
 use yadict::render::{DefaultRender, Render};
 
 #[derive(Parser)]
@@ -43,6 +57,29 @@ enum Commands {
 
     /// List all installed dictionaries in ~/.yadict/mdicts/
     List,
+
+    /// Browse and search the remote dictionary index (mdx.mdict.org)
+    Registry {
+        #[command(subcommand)]
+        action: RegistryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryAction {
+    /// List available dictionaries, optionally filtered by a search term
+    List {
+        /// Case-insensitive substring to filter by name or category
+        query: Option<String>,
+    },
+
+    /// Search dictionaries by name or category
+    Search {
+        query: String,
+    },
+
+    /// Re-crawl mdx.mdict.org and rebuild the local index cache
+    Refresh,
 }
 
 /// URL-keyed disk cache. Index is stored in `~/.yadict/cache.tsv` (tab-separated: url\tabsolute_path).
@@ -191,6 +228,142 @@ fn yadict_home() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(".yadict"))
 }
 
+/// Launch the multi-select registry TUI and return URLs chosen by the user.
+/// Restores the terminal before returning, even on error.
+fn run_registry_tui(entries: &[&DictEntry]) -> anyhow::Result<Vec<String>> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = tui_select_loop(&mut terminal, entries);
+
+    disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn tui_select_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    entries: &[&DictEntry],
+) -> anyhow::Result<Vec<String>> {
+    let mut selected = vec![false; entries.len()];
+    let mut list_state = ListState::default();
+    list_state.select(Some(0));
+
+    loop {
+        let sel_count = selected.iter().filter(|&&s| s).count();
+
+        terminal.draw(|f| {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            let title = format!(
+                " yadict registry — {} selected / {} total ",
+                sel_count,
+                entries.len()
+            );
+            let items: Vec<ListItem> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let check = if selected[i] { "[x]" } else { "[ ]" };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(check, Style::default().fg(TuiColor::Yellow)),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("[{}]", e.category),
+                            Style::default().fg(TuiColor::Rgb(120, 120, 140)),
+                        ),
+                        Span::raw("  "),
+                        Span::raw(e.name.clone()),
+                        Span::raw("  "),
+                        Span::styled(
+                            e.size_human(),
+                            Style::default().fg(TuiColor::Rgb(80, 180, 80)),
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("  ");
+
+            f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+            let hint = "  ↑↓/jk: move  PgUp/PgDn: scroll  SPACE: toggle  a: all/none  ENTER: add selected  q: quit";
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(TuiColor::DarkGray),
+                ))),
+                chunks[1],
+            );
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(vec![]),
+                KeyCode::Enter => {
+                    return Ok(entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, e)| if selected[i] { Some(e.url.clone()) } else { None })
+                        .collect());
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(i) = list_state.selected() {
+                        if i > 0 {
+                            list_state.select(Some(i - 1));
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(i) = list_state.selected() {
+                        if i + 1 < entries.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(i) = list_state.selected() {
+                        list_state.select(Some(i.saturating_sub(20)));
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(i) = list_state.selected() {
+                        list_state.select(Some((i + 20).min(entries.len().saturating_sub(1))));
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(i) = list_state.selected() {
+                        selected[i] = !selected[i];
+                        if i + 1 < entries.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
+                }
+                KeyCode::Char('a') => {
+                    let all = selected.iter().all(|&s| s);
+                    selected.iter_mut().for_each(|s| *s = !all);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::try_init().ok();
 
@@ -201,6 +374,53 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Add { url } => {
             download_to_cache(&url)?;
+        }
+        Commands::Registry { action } => {
+            let mut reg = MdictOrgRegistry::new(&yadict_home()?);
+            match action {
+                RegistryAction::Refresh => {
+                    reg.refresh()?;
+                }
+                RegistryAction::List { query } => {
+                    if reg.is_stale() {
+                        eprintln!("Registry is empty. Run `yadict registry refresh` to build the index.");
+                        return Ok(());
+                    }
+                    let entries: Vec<_> = match &query {
+                        Some(q) => reg.search(q),
+                        None => reg.entries().iter().collect(),
+                    };
+                    if entries.is_empty() {
+                        println!("No dictionaries found.");
+                    } else {
+                        let urls = run_registry_tui(&entries)?;
+                        for url in &urls {
+                            download_to_cache(url)?;
+                        }
+                    }
+                }
+                RegistryAction::Search { query } => {
+                    if reg.is_stale() {
+                        eprintln!("Registry is empty. Run `yadict registry refresh` to build the index.");
+                        return Ok(());
+                    }
+                    let entries = reg.search(&query);
+                    if entries.is_empty() {
+                        println!("No dictionaries found.");
+                    } else {
+                        for e in &entries {
+                            print!("{}", SetForegroundColor(Color::Rgb { r: 100, g: 100, b: 120 }));
+                            print!("[{}]", e.category);
+                            print!("{}", ResetColor);
+                            print!(" {}", e.name);
+                            print!("{}", SetForegroundColor(Color::Rgb { r: 80, g: 180, b: 80 }));
+                            println!("  {}", e.size_human());
+                            print!("{}", ResetColor);
+                        }
+                        println!("\n{} dictionaries found.", entries.len());
+                    }
+                }
+            }
         }
         Commands::List => {
             let mdicts_dir = yadict_home()?.join("mdicts");

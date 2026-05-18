@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,9 @@ pub struct DictEntry {
     pub url: String,
     /// File size in bytes (0 = unknown).
     pub size: u64,
-    /// Category path, segments joined with " / ".
-    pub category: String,
+    /// Independent category paths this entry belongs to.
+    /// Each element may contain " / " to denote sub-hierarchy within that category.
+    pub categories: Vec<String>,
     /// Name of the registry this entry came from.
     pub registry: String,
 }
@@ -67,21 +68,25 @@ struct YamlFile {
     resources: Vec<YamlResource>,
 }
 
+// ── Built-in registry ─────────────────────────────────────────────────────────
+
+const BUILTIN_REGISTRY: &str = include_str!("../../registry.yaml");
+
 // ── LocalRegistry ─────────────────────────────────────────────────────────────
 
 /// Reads all `.yaml` / `.yml` registry files from `~/.yadict/registries/`.
-///
-/// Registry format: see `registry.yaml` in the project root.
+/// The built-in registry (registry.yaml) is always loaded first.
 pub struct LocalRegistry {
     entries: Vec<DictEntry>,
     dir: PathBuf,
 }
 
 impl LocalRegistry {
-    /// Load all installed registries from `<home>/registries/`.
+    /// Load the built-in registry plus all user-installed registries from `<home>/registries/`.
     pub fn new(home_dir: &Path) -> Self {
         let dir = home_dir.join("registries");
-        let entries = Self::load_dir(&dir).unwrap_or_default();
+        let mut entries = Self::parse_yaml(BUILTIN_REGISTRY).unwrap_or_default();
+        entries.extend(Self::load_dir(&dir).unwrap_or_default());
         Self { entries, dir }
     }
 
@@ -91,10 +96,10 @@ impl LocalRegistry {
     pub fn install(src: &str, home_dir: &Path) -> Result<()> {
         let content = if src.starts_with("https://") || src.starts_with("http://") {
             eprintln!("Downloading registry from {} ...", src);
-            ureq::get(src)
-                .call()
+            reqwest::blocking::get(src)
+                .and_then(|r| r.error_for_status())
                 .map_err(|e| anyhow!("Download failed: {e}"))?
-                .into_string()?
+                .text()?
         } else {
             std::fs::read_to_string(src)?
         };
@@ -141,8 +146,13 @@ impl LocalRegistry {
 
     fn load_file(path: &Path) -> Result<Vec<DictEntry>> {
         let content = std::fs::read_to_string(path)?;
-        let yaml: YamlFile = serde_yaml::from_str(&content)
-            .map_err(|e| anyhow!("Parse error in {}: {e}", path.display()))?;
+        Self::parse_yaml(&content)
+            .map_err(|e| anyhow!("{} in {}", e, path.display()))
+    }
+
+    fn parse_yaml(content: &str) -> Result<Vec<DictEntry>> {
+        let yaml: YamlFile =
+            serde_yaml::from_str(content).map_err(|e| anyhow!("Parse error: {e}"))?;
         let registry = yaml.metadata.name.clone();
         Ok(yaml
             .resources
@@ -151,7 +161,7 @@ impl LocalRegistry {
                 name: r.name,
                 url: r.mdx,
                 size: 0,
-                category: r.category.join(" / "),
+                categories: r.category,
                 registry: registry.clone(),
             })
             .collect())
@@ -169,19 +179,21 @@ impl Registry for LocalRegistry {
             .iter()
             .filter(|e| {
                 e.name.to_lowercase().contains(&q)
-                    || e.category.to_lowercase().contains(&q)
+                    || e.categories.iter().any(|c| c.to_lowercase().contains(&q))
                     || e.registry.to_lowercase().contains(&q)
             })
             .collect()
     }
 
     fn refresh(&mut self) -> Result<()> {
-        self.entries = Self::load_dir(&self.dir).unwrap_or_default();
+        let mut entries = Self::parse_yaml(BUILTIN_REGISTRY).unwrap_or_default();
+        entries.extend(Self::load_dir(&self.dir).unwrap_or_default());
+        self.entries = entries;
         eprintln!("Reloaded {} entries from registries.", self.entries.len());
         Ok(())
     }
 
     fn is_stale(&self) -> bool {
-        self.entries.is_empty()
+        false
     }
 }

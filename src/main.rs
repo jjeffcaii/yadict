@@ -10,7 +10,7 @@ extern crate anyhow;
 #[macro_use]
 extern crate log;
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, sync::{Arc, Mutex}};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -39,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Translate a word by querying all dictionaries in ~/.yadict/mdicts/
+    /// Translate a word by querying all dictionaries in ~/.yadict/registry/<name>/
     Translate {
         /// Word to look up
         word: String,
@@ -47,16 +47,18 @@ enum Commands {
         /// Print raw Markdown instead of rendered terminal output
         #[arg(long)]
         markdown: bool,
+
+        /// Registry name to query (scans ~/.yadict/registry/<name>/)
+        #[arg(short = 'r', long = "registry", default_value = "default")]
+        registry: String,
     },
 
-    /// Download a remote .mdx dictionary to ~/.yadict/mdicts/
-    Add {
-        /// HTTP(S) URL of the .mdx file to download
-        url: String,
+    /// List all installed dictionaries in ~/.yadict/registry/<name>/
+    List {
+        /// Registry name to list (scans ~/.yadict/registry/<name>/)
+        #[arg(short = 'r', long = "registry", default_value = "default")]
+        registry: String,
     },
-
-    /// List all installed dictionaries in ~/.yadict/mdicts/
-    List,
 
     /// Browse and search the remote dictionary index (mdx.mdict.org)
     Registry {
@@ -92,9 +94,9 @@ struct CacheStore {
 }
 
 impl CacheStore {
-    fn new(cache_dir: &std::path::Path) -> Self {
+    fn new(home: &std::path::Path) -> Self {
         Self {
-            index_path: cache_dir.join("cache.tsv"),
+            index_path: home.join("cache.tsv"),
         }
     }
 
@@ -124,98 +126,93 @@ impl CacheStore {
     }
 }
 
-/// Download a remote dictionary URL to ~/.yadict/mdicts/ and record it in the cache index.
-/// Returns the local path. If the URL is already cached and the file exists, returns
-/// the cached path immediately without re-downloading.
-fn download_to_cache(url: &str) -> anyhow::Result<PathBuf> {
-    let cache_dir = yadict_home()?.join("mdicts");
-    std::fs::create_dir_all(&cache_dir)?;
-
-    let store = CacheStore::new(&cache_dir);
-
-    if let Some(cached) = store.lookup(url) {
-        debug!("using cached file: {}", cached.display());
-        return Ok(cached);
+/// Download selected entries into `<home>/registry/<registry>/<name>.mdx` in parallel.
+/// Already-cached files are skipped. Errors are printed per-file; other downloads continue.
+fn download_files(entries: &[&DictEntry], home: &std::path::Path) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
     }
 
-    eprintln!("Downloading {} ...", url);
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| anyhow!("Download failed: {e}"))?;
+    let store = Arc::new(Mutex::new(CacheStore::new(home)));
+    let client = Arc::new(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()?,
+    );
 
-    // Resolve filename: Content-Disposition header takes priority over URL path.
-    let filename = resolve_filename(url, &resp)?;
-    let dest = cache_dir.join(&filename);
-
-    let mut file = std::fs::File::create(&dest)?;
-    std::io::copy(&mut resp.into_reader(), &mut file)?;
-
-    store.insert(url, &dest)?;
-    eprintln!("Saved to {}", dest.display());
-
-    Ok(dest)
+    std::thread::scope(|s| {
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let store = Arc::clone(&store);
+                let client = Arc::clone(&client);
+                let url = entry.url.clone();
+                let dest = home
+                    .join("registry")
+                    .join(&entry.registry)
+                    .join(format!("{}.mdx", entry.name));
+                s.spawn(move || {
+                    if let Some(cached) = store.lock().unwrap().lookup(&url) {
+                        debug!("using cached file: {}", cached.display());
+                        return;
+                    }
+                    if let Some(parent) = dest.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("Error creating {}: {e}", parent.display());
+                            return;
+                        }
+                    }
+                    eprintln!("Downloading {} ...", url);
+                    match fetch_file(&url, &dest, &client) {
+                        Ok(()) => {
+                            if let Err(e) = store.lock().unwrap().insert(&url, &dest) {
+                                eprintln!("Warning: failed to record cache entry: {e}");
+                            }
+                            eprintln!("Saved to {}", dest.display());
+                        }
+                        Err(e) => eprintln!("Error downloading {url}: {e}"),
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    Ok(())
 }
 
-/// Determine the local filename for a downloaded resource.
-/// Prefers the `Content-Disposition` header; falls back to the percent-decoded URL path segment.
-fn resolve_filename(url: &str, resp: &ureq::Response) -> anyhow::Result<String> {
-    if let Some(cd) = resp.header("content-disposition") {
-        if let Some(name) = parse_content_disposition(cd) {
-            return Ok(name);
-        }
-    }
-
-    let raw = url
-        .split('/')
-        .next_back()
-        .and_then(|s| s.split('?').next())
-        .and_then(|s| s.split('#').next())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("Cannot derive filename from URL: {}", url))?;
-
-    Ok(percent_decode(raw))
+/// Fetch a URL and write the body directly to `dest`.
+fn fetch_file(
+    url: &str,
+    dest: &std::path::Path,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<()> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow!("Request failed: {e}"))?;
+    let mut file = std::fs::File::create(dest)?;
+    std::io::copy(&mut resp, &mut file)?;
+    Ok(())
 }
 
-/// Parse the filename from a `Content-Disposition` header value.
-/// Handles both `filename="foo.mdx"` and the RFC 5987 `filename*=UTF-8''foo.mdx` form.
-fn parse_content_disposition(header: &str) -> Option<String> {
-    let mut plain: Option<String> = None;
-    for part in header.split(';') {
-        let part = part.trim();
-        // RFC 5987 extended form takes priority (filename*=charset'lang'encoded).
-        if let Some(val) = part.strip_prefix("filename*=") {
-            let encoded = val.splitn(3, '\'').nth(2).unwrap_or(val);
-            return Some(percent_decode(encoded));
-        }
-        if let Some(val) = part.strip_prefix("filename=") {
-            let name = val.trim().trim_matches('"');
-            if !name.is_empty() {
-                plain = Some(name.to_string());
-            }
+/// Find all `.mdx` files under `<home>/registry/<registry_name>/`.
+fn find_mdx_files(home: &std::path::Path, registry_name: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = home.join("registry").join(registry_name);
+    let mut paths = Vec::new();
+    if !dir.exists() {
+        return Ok(paths);
+    }
+    for entry in std::fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().is_some_and(|ext| ext == "mdx") {
+            paths.push(p);
         }
     }
-    plain
-}
-
-/// Percent-decode a URL-encoded string, returning valid UTF-8.
-fn percent_decode(s: &str) -> String {
-    let src = s.as_bytes();
-    let mut buf: Vec<u8> = Vec::with_capacity(src.len());
-    let mut i = 0;
-    while i < src.len() {
-        if src[i] == b'%' && i + 2 < src.len() {
-            if let Ok(b) =
-                u8::from_str_radix(std::str::from_utf8(&src[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                buf.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        buf.push(src[i]);
-        i += 1;
-    }
-    String::from_utf8(buf).unwrap_or_else(|_| s.to_string())
+    paths.sort();
+    Ok(paths)
 }
 
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -262,13 +259,15 @@ enum VisibleRow {
 fn build_category_tree(entries: &[&DictEntry]) -> Vec<CategoryNode> {
     let mut roots: Vec<CategoryNode> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
-        let segs: Vec<&str> = entry
-            .category
-            .split(" / ")
-            .filter(|s| !s.is_empty())
-            .collect();
-        let segs: &[&str] = if segs.is_empty() { &["(root)"] } else { &segs };
-        insert_into_tree(&mut roots, segs, "", i);
+        if entry.categories.is_empty() {
+            insert_into_tree(&mut roots, &["(uncategorized)"], "", i);
+        } else {
+            for cat in &entry.categories {
+                let segs: Vec<&str> = cat.split(" / ").filter(|s| !s.is_empty()).collect();
+                let segs: &[&str] = if segs.is_empty() { &["(uncategorized)"] } else { &segs };
+                insert_into_tree(&mut roots, segs, "", i);
+            }
+        }
     }
     roots
 }
@@ -338,7 +337,8 @@ fn filter_entries(entries: &[&DictEntry], query: &str) -> Vec<VisibleRow> {
         .iter()
         .enumerate()
         .filter(|(_, e)| {
-            e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
+            e.name.to_lowercase().contains(&q)
+                || e.categories.iter().any(|c| c.to_lowercase().contains(&q))
         })
         .map(|(idx, _)| VisibleRow::Entry {
             entry_idx: idx,
@@ -393,9 +393,9 @@ fn make_list_item(
                 Span::styled(check.to_string(), Style::default().fg(TuiColor::Yellow)),
                 Span::raw("  "),
             ];
-            if *show_category && !e.category.is_empty() {
+            if *show_category && !e.categories.is_empty() {
                 spans.push(Span::styled(
-                    format!("[{}]  ", e.category),
+                    format!("[{}]  ", e.categories.join(", ")),
                     Style::default().fg(TuiColor::Rgb(120, 120, 140)),
                 ));
             }
@@ -689,9 +689,6 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Add { url } => {
-            download_to_cache(&url)?;
-        }
         Commands::Registry { action } => {
             let home = yadict_home()?;
             match action {
@@ -718,9 +715,14 @@ fn main() -> anyhow::Result<()> {
                         println!("No dictionaries found.");
                     } else {
                         let urls = run_registry_tui(&entries)?;
-                        for url in &urls {
-                            download_to_cache(url)?;
-                        }
+                        let url_set: std::collections::HashSet<&str> =
+                            urls.iter().map(|s| s.as_str()).collect();
+                        let selected: Vec<&DictEntry> = entries
+                            .iter()
+                            .filter(|e| url_set.contains(e.url.as_str()))
+                            .copied()
+                            .collect();
+                        download_files(&selected, &home)?;
                     }
                 }
                 RegistryAction::Search { query } => {
@@ -737,7 +739,7 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         for e in &entries {
                             print!("{}", SetForegroundColor(Color::Rgb { r: 100, g: 100, b: 120 }));
-                            print!("[{}]", e.category);
+                            print!("[{}]", e.categories.join(", "));
                             print!("{}", ResetColor);
                             print!(" {}", e.name);
                             print!("{}", SetForegroundColor(Color::Rgb { r: 80, g: 180, b: 80 }));
@@ -749,38 +751,26 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::List => {
-            let mdicts_dir = yadict_home()?.join("mdicts");
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(&mdicts_dir)
-                .map_err(|e| anyhow!("Cannot read {}: {e}", mdicts_dir.display()))?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "mdx"))
-                .collect();
-            paths.sort();
+        Commands::List { registry } => {
+            let home = yadict_home()?;
+            let paths = find_mdx_files(&home, &registry)?;
             if paths.is_empty() {
-                println!("No dictionaries installed. Use 'yadict add <URL>' to install one.");
+                println!(
+                    "No dictionaries installed in registry '{registry}'. Use `yadict registry list` to browse and install."
+                );
             } else {
                 for path in &paths {
                     println!("{}", path.file_name().unwrap_or_default().to_string_lossy());
                 }
             }
         }
-        Commands::Translate { word, markdown } => {
-            let mdicts_dir = yadict_home()?.join("mdicts");
-
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(&mdicts_dir)
-                .map_err(|e| anyhow!("Cannot read {}: {e}", mdicts_dir.display()))?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "mdx"))
-                .collect();
-            paths.sort();
+        Commands::Translate { word, markdown, registry } => {
+            let home = yadict_home()?;
+            let paths = find_mdx_files(&home, &registry)?;
 
             if paths.is_empty() {
                 eprintln!(
-                    "No dictionaries found in {}. Use 'yadict add <URL>' to install one.",
-                    mdicts_dir.display()
+                    "No dictionaries found in registry '{registry}'. Use `yadict registry list` to browse and install."
                 );
                 return Ok(());
             }

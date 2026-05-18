@@ -1,6 +1,6 @@
 # registry的一些元数据
 metadata:
-  name: mdict
+  name: default
   url: https://mdict.org/
 
 # 下载资源列表, 每个资源包含以下属性

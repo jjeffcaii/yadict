@@ -10,7 +10,7 @@ extern crate anyhow;
 #[macro_use]
 extern crate log;
 
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -228,6 +228,150 @@ fn yadict_home() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(".yadict"))
 }
 
+// ── Tree data types ───────────────────────────────────────────────────────────
+
+struct CategoryNode {
+    segment: String,
+    full_path: String,
+    children: Vec<CategoryNode>,
+    entry_indices: Vec<usize>,
+}
+
+#[derive(Clone)]
+enum VisibleRow {
+    Category {
+        segment: String,
+        full_path: String,
+        depth: usize,
+        expanded: bool,
+        entry_count: usize,
+    },
+    Entry {
+        entry_idx: usize,
+        depth: usize,
+        show_category: bool,
+    },
+}
+
+// ── Tree helpers ──────────────────────────────────────────────────────────────
+
+fn build_category_tree(entries: &[&DictEntry]) -> Vec<CategoryNode> {
+    let mut roots: Vec<CategoryNode> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let segs: Vec<&str> = entry.category.split(" / ").filter(|s| !s.is_empty()).collect();
+        let segs: &[&str] = if segs.is_empty() { &["(root)"] } else { &segs };
+        insert_into_tree(&mut roots, segs, "", i);
+    }
+    roots
+}
+
+fn insert_into_tree(nodes: &mut Vec<CategoryNode>, segs: &[&str], parent_path: &str, idx: usize) {
+    let seg = segs[0];
+    let full_path = if parent_path.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{} / {}", parent_path, seg)
+    };
+    let pos = nodes.iter().position(|n| n.segment == seg).unwrap_or_else(|| {
+        nodes.push(CategoryNode {
+            segment: seg.to_string(),
+            full_path: full_path.clone(),
+            children: Vec::new(),
+            entry_indices: Vec::new(),
+        });
+        nodes.len() - 1
+    });
+    if segs.len() == 1 {
+        nodes[pos].entry_indices.push(idx);
+    } else {
+        let fp = nodes[pos].full_path.clone();
+        insert_into_tree(&mut nodes[pos].children, &segs[1..], &fp, idx);
+    }
+}
+
+fn count_tree_entries(node: &CategoryNode) -> usize {
+    node.entry_indices.len() + node.children.iter().map(count_tree_entries).sum::<usize>()
+}
+
+fn flatten_tree(
+    nodes: &[CategoryNode],
+    depth: usize,
+    expanded: &HashSet<String>,
+    out: &mut Vec<VisibleRow>,
+) {
+    for node in nodes {
+        let is_expanded = expanded.contains(&node.full_path);
+        out.push(VisibleRow::Category {
+            segment: node.segment.clone(),
+            full_path: node.full_path.clone(),
+            depth,
+            expanded: is_expanded,
+            entry_count: count_tree_entries(node),
+        });
+        if is_expanded {
+            flatten_tree(&node.children, depth + 1, expanded, out);
+            for &entry_idx in &node.entry_indices {
+                out.push(VisibleRow::Entry { entry_idx, depth: depth + 1, show_category: false });
+            }
+        }
+    }
+}
+
+fn filter_entries(entries: &[&DictEntry], query: &str) -> Vec<VisibleRow> {
+    let q = query.to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q))
+        .map(|(idx, _)| VisibleRow::Entry { entry_idx: idx, depth: 0, show_category: true })
+        .collect()
+}
+
+fn make_list_item(
+    row: &VisibleRow,
+    entries: &[&DictEntry],
+    selected_urls: &HashSet<String>,
+) -> ListItem<'static> {
+    match row {
+        VisibleRow::Category { segment, depth, expanded, entry_count, .. } => {
+            let arrow = if *expanded { "▼ " } else { "▶ " };
+            ListItem::new(Line::from(vec![
+                Span::raw("  ".repeat(*depth)),
+                Span::styled(arrow.to_string(), Style::default().fg(TuiColor::Cyan)),
+                Span::styled(
+                    segment.clone(),
+                    Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({} dicts)", entry_count),
+                    Style::default().fg(TuiColor::Rgb(100, 100, 120)),
+                ),
+            ]))
+        }
+        VisibleRow::Entry { entry_idx, depth, show_category } => {
+            let e = entries[*entry_idx];
+            let check = if selected_urls.contains(&e.url) { "[x]" } else { "[ ]" };
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::raw("  ".repeat(*depth)),
+                Span::styled(check.to_string(), Style::default().fg(TuiColor::Yellow)),
+                Span::raw("  "),
+            ];
+            if *show_category && !e.category.is_empty() {
+                spans.push(Span::styled(
+                    format!("[{}]  ", e.category),
+                    Style::default().fg(TuiColor::Rgb(120, 120, 140)),
+                ));
+            }
+            spans.push(Span::raw(e.name.clone()));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(e.size_human(), Style::default().fg(TuiColor::Rgb(80, 180, 80))));
+            ListItem::new(Line::from(spans))
+        }
+    }
+}
+
+// ── TUI entry point ───────────────────────────────────────────────────────────
+
 /// Launch the multi-select registry TUI and return URLs chosen by the user.
 /// Restores the terminal before returning, even on error.
 fn run_registry_tui(entries: &[&DictEntry]) -> anyhow::Result<Vec<String>> {
@@ -250,62 +394,83 @@ fn tui_select_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     entries: &[&DictEntry],
 ) -> anyhow::Result<Vec<String>> {
-    let mut selected = vec![false; entries.len()];
+    let tree = build_category_tree(entries);
+    // Expand all top-level nodes by default.
+    let mut expanded: HashSet<String> = tree.iter().map(|n| n.full_path.clone()).collect();
+    let mut selected_urls: HashSet<String> = HashSet::new();
     let mut list_state = ListState::default();
     list_state.select(Some(0));
+    let mut search_query = String::new();
+    let mut search_active = false;
 
     loop {
-        let sel_count = selected.iter().filter(|&&s| s).count();
+        let visible: Vec<VisibleRow> = if search_query.is_empty() {
+            let mut rows = Vec::new();
+            flatten_tree(&tree, 0, &expanded, &mut rows);
+            rows
+        } else {
+            filter_entries(entries, &search_query)
+        };
+
+        // Clamp cursor when the list shrinks (e.g. after search filter narrows results).
+        if let Some(i) = list_state.selected() {
+            if !visible.is_empty() && i >= visible.len() {
+                list_state.select(Some(visible.len() - 1));
+            }
+        }
+        if list_state.selected().is_none() && !visible.is_empty() {
+            list_state.select(Some(0));
+        }
+
+        let sel_count = selected_urls.len();
 
         terminal.draw(|f| {
             let area = f.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
                 .split(area);
 
+            // Search bar
+            let search_bar = if search_active {
+                Line::from(vec![
+                    Span::styled(" / ", Style::default().fg(TuiColor::Yellow)),
+                    Span::raw(search_query.clone()),
+                    Span::styled("▌", Style::default().fg(TuiColor::Yellow)),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    " Press / to search",
+                    Style::default().fg(TuiColor::DarkGray),
+                ))
+            };
+            f.render_widget(Paragraph::new(search_bar), chunks[0]);
+
+            // Directory tree / search results
             let title = format!(
                 " yadict registry — {} selected / {} total ",
                 sel_count,
                 entries.len()
             );
-            let items: Vec<ListItem> = entries
+            let items: Vec<ListItem> = visible
                 .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let check = if selected[i] { "[x]" } else { "[ ]" };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(check, Style::default().fg(TuiColor::Yellow)),
-                        Span::raw("  "),
-                        Span::styled(
-                            format!("[{}]", e.category),
-                            Style::default().fg(TuiColor::Rgb(120, 120, 140)),
-                        ),
-                        Span::raw("  "),
-                        Span::raw(e.name.clone()),
-                        Span::raw("  "),
-                        Span::styled(
-                            e.size_human(),
-                            Style::default().fg(TuiColor::Rgb(80, 180, 80)),
-                        ),
-                    ]))
-                })
+                .map(|row| make_list_item(row, entries, &selected_urls))
                 .collect();
-
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(title))
                 .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("  ");
+            f.render_stateful_widget(list, chunks[1], &mut list_state);
 
-            f.render_stateful_widget(list, chunks[0], &mut list_state);
-
-            let hint = "  ↑↓/jk: move  PgUp/PgDn: scroll  SPACE: toggle  a: all/none  ENTER: add selected  q: quit";
+            // Key-binding hint
+            let hint = if search_active {
+                "  ESC: clear search  ↑↓/jk: move  SPACE: toggle  ENTER: download selected  q: quit"
+            } else {
+                "  /: search  ↑↓/jk: move  l/h→←: expand  SPACE: toggle  a: all  ENTER: download  q: quit"
+            };
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    hint,
-                    Style::default().fg(TuiColor::DarkGray),
-                ))),
-                chunks[1],
+                Paragraph::new(Span::styled(hint, Style::default().fg(TuiColor::DarkGray))),
+                chunks[2],
             );
         })?;
 
@@ -313,52 +478,140 @@ fn tui_select_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(vec![]),
-                KeyCode::Enter => {
-                    return Ok(entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, e)| if selected[i] { Some(e.url.clone()) } else { None })
-                        .collect());
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(i) = list_state.selected() {
-                        if i > 0 {
-                            list_state.select(Some(i - 1));
+
+            if search_active {
+                match key.code {
+                    KeyCode::Esc => {
+                        search_query.clear();
+                        search_active = false;
+                        list_state.select(Some(0));
+                    }
+                    KeyCode::Backspace => {
+                        search_query.pop();
+                        list_state.select(Some(0));
+                    }
+                    KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(i) = list_state.selected() {
+                            if i > 0 { list_state.select(Some(i - 1)); }
                         }
                     }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(i) = list_state.selected() {
-                        if i + 1 < entries.len() {
-                            list_state.select(Some(i + 1));
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(i) = list_state.selected() {
+                            if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
                         }
                     }
-                }
-                KeyCode::PageUp => {
-                    if let Some(i) = list_state.selected() {
-                        list_state.select(Some(i.saturating_sub(20)));
-                    }
-                }
-                KeyCode::PageDown => {
-                    if let Some(i) = list_state.selected() {
-                        list_state.select(Some((i + 20).min(entries.len().saturating_sub(1))));
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(i) = list_state.selected() {
-                        selected[i] = !selected[i];
-                        if i + 1 < entries.len() {
-                            list_state.select(Some(i + 1));
+                    KeyCode::PageUp => {
+                        if let Some(i) = list_state.selected() {
+                            list_state.select(Some(i.saturating_sub(20)));
                         }
                     }
+                    KeyCode::PageDown => {
+                        if let Some(i) = list_state.selected() {
+                            list_state.select(Some((i + 20).min(visible.len().saturating_sub(1))));
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(i) = list_state.selected() {
+                            if let Some(VisibleRow::Entry { entry_idx, .. }) = visible.get(i) {
+                                let url = entries[*entry_idx].url.clone();
+                                if !selected_urls.remove(&url) { selected_urls.insert(url); }
+                                if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                            }
+                        }
+                    }
+                    // Any other character appends to the search query.
+                    KeyCode::Char(c) => {
+                        search_query.push(c);
+                        list_state.select(Some(0));
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('a') => {
-                    let all = selected.iter().all(|&s| s);
-                    selected.iter_mut().for_each(|s| *s = !all);
+            } else {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(vec![]),
+                    KeyCode::Char('/') => {
+                        search_active = true;
+                        search_query.clear();
+                        list_state.select(Some(0));
+                    }
+                    KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(i) = list_state.selected() {
+                            if i > 0 { list_state.select(Some(i - 1)); }
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(i) = list_state.selected() {
+                            if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(i) = list_state.selected() {
+                            list_state.select(Some(i.saturating_sub(20)));
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(i) = list_state.selected() {
+                            list_state.select(Some((i + 20).min(visible.len().saturating_sub(1))));
+                        }
+                    }
+                    // Expand/collapse
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        if let Some(i) = list_state.selected() {
+                            if let Some(VisibleRow::Category { full_path, .. }) = visible.get(i) {
+                                expanded.insert(full_path.clone());
+                            }
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if let Some(i) = list_state.selected() {
+                            if let Some(VisibleRow::Category { full_path, .. }) = visible.get(i) {
+                                expanded.remove(full_path.as_str());
+                            }
+                        }
+                    }
+                    // Space: toggle expand on categories, toggle selection on entries.
+                    KeyCode::Char(' ') => {
+                        if let Some(i) = list_state.selected() {
+                            match visible.get(i) {
+                                Some(VisibleRow::Category { full_path, expanded: is_exp, .. }) => {
+                                    if *is_exp {
+                                        expanded.remove(full_path.as_str());
+                                    } else {
+                                        expanded.insert(full_path.clone());
+                                    }
+                                }
+                                Some(VisibleRow::Entry { entry_idx, .. }) => {
+                                    let url = entries[*entry_idx].url.clone();
+                                    if !selected_urls.remove(&url) { selected_urls.insert(url); }
+                                    if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    // Select / deselect all currently visible entries.
+                    KeyCode::Char('a') => {
+                        let visible_urls: Vec<String> = visible
+                            .iter()
+                            .filter_map(|row| {
+                                if let VisibleRow::Entry { entry_idx, .. } = row {
+                                    Some(entries[*entry_idx].url.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let all = visible_urls.iter().all(|u| selected_urls.contains(u));
+                        if all {
+                            for u in &visible_urls { selected_urls.remove(u); }
+                        } else {
+                            for u in visible_urls { selected_urls.insert(u); }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }

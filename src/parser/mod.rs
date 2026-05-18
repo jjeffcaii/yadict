@@ -15,21 +15,31 @@ mod tests {
 
     static MDX: Lazy<Mdx> = Lazy::new(|| parse("/tmp/example.mdx").expect("failed to read mdx"));
 
+    #[ignore]
+    #[test]
+    fn test_list() {
+        init();
+        info!("encoding: {}", &MDX.encoding);
+
+        for key in MDX.keys() {
+            info!("{:?}", crate::lang::decode(&MDX.encoding, key.text));
+        }
+    }
+
     #[test]
     fn test_query() -> anyhow::Result<()> {
         init();
 
-        info!("{}", &*MDX);
+        for word in &["cat", "dog", "猫", "狗"] {
+            let result = MDX.lookup(word);
 
-        let result = MDX.lookup("bird");
+            assert!(!result.is_empty());
 
-        assert!(!result.is_empty());
-
-        for record in result {
-            let key = unsafe { std::str::from_utf8_unchecked(record.key()) };
-            let value = unsafe { record.value().map(|b| std::str::from_utf8_unchecked(b)) };
-
-            info!("{}: {:?}", key, value);
+            for record in result {
+                let key = record.key();
+                let value = record.value();
+                info!("{}: {:?}", key, value);
+            }
         }
 
         Ok(())

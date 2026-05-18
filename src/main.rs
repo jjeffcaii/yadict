@@ -16,15 +16,15 @@ use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     style::{Color, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color as TuiColor, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Terminal,
 };
 use yadict::parser;
 use yadict::registry::{DictEntry, MdictOrgRegistry, Registry};
@@ -74,9 +74,7 @@ enum RegistryAction {
     },
 
     /// Search dictionaries by name or category
-    Search {
-        query: String,
-    },
+    Search { query: String },
 
     /// Re-crawl mdx.mdict.org and rebuild the local index cache
     Refresh,
@@ -258,7 +256,11 @@ enum VisibleRow {
 fn build_category_tree(entries: &[&DictEntry]) -> Vec<CategoryNode> {
     let mut roots: Vec<CategoryNode> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
-        let segs: Vec<&str> = entry.category.split(" / ").filter(|s| !s.is_empty()).collect();
+        let segs: Vec<&str> = entry
+            .category
+            .split(" / ")
+            .filter(|s| !s.is_empty())
+            .collect();
         let segs: &[&str] = if segs.is_empty() { &["(root)"] } else { &segs };
         insert_into_tree(&mut roots, segs, "", i);
     }
@@ -272,15 +274,18 @@ fn insert_into_tree(nodes: &mut Vec<CategoryNode>, segs: &[&str], parent_path: &
     } else {
         format!("{} / {}", parent_path, seg)
     };
-    let pos = nodes.iter().position(|n| n.segment == seg).unwrap_or_else(|| {
-        nodes.push(CategoryNode {
-            segment: seg.to_string(),
-            full_path: full_path.clone(),
-            children: Vec::new(),
-            entry_indices: Vec::new(),
+    let pos = nodes
+        .iter()
+        .position(|n| n.segment == seg)
+        .unwrap_or_else(|| {
+            nodes.push(CategoryNode {
+                segment: seg.to_string(),
+                full_path: full_path.clone(),
+                children: Vec::new(),
+                entry_indices: Vec::new(),
+            });
+            nodes.len() - 1
         });
-        nodes.len() - 1
-    });
     if segs.len() == 1 {
         nodes[pos].entry_indices.push(idx);
     } else {
@@ -311,7 +316,11 @@ fn flatten_tree(
         if is_expanded {
             flatten_tree(&node.children, depth + 1, expanded, out);
             for &entry_idx in &node.entry_indices {
-                out.push(VisibleRow::Entry { entry_idx, depth: depth + 1, show_category: false });
+                out.push(VisibleRow::Entry {
+                    entry_idx,
+                    depth: depth + 1,
+                    show_category: false,
+                });
             }
         }
     }
@@ -322,8 +331,14 @@ fn filter_entries(entries: &[&DictEntry], query: &str) -> Vec<VisibleRow> {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q))
-        .map(|(idx, _)| VisibleRow::Entry { entry_idx: idx, depth: 0, show_category: true })
+        .filter(|(_, e)| {
+            e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
+        })
+        .map(|(idx, _)| VisibleRow::Entry {
+            entry_idx: idx,
+            depth: 0,
+            show_category: true,
+        })
         .collect()
 }
 
@@ -333,14 +348,22 @@ fn make_list_item(
     selected_urls: &HashSet<String>,
 ) -> ListItem<'static> {
     match row {
-        VisibleRow::Category { segment, depth, expanded, entry_count, .. } => {
+        VisibleRow::Category {
+            segment,
+            depth,
+            expanded,
+            entry_count,
+            ..
+        } => {
             let arrow = if *expanded { "▼ " } else { "▶ " };
             ListItem::new(Line::from(vec![
                 Span::raw("  ".repeat(*depth)),
                 Span::styled(arrow.to_string(), Style::default().fg(TuiColor::Cyan)),
                 Span::styled(
                     segment.clone(),
-                    Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(TuiColor::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  ({} dicts)", entry_count),
@@ -348,9 +371,17 @@ fn make_list_item(
                 ),
             ]))
         }
-        VisibleRow::Entry { entry_idx, depth, show_category } => {
+        VisibleRow::Entry {
+            entry_idx,
+            depth,
+            show_category,
+        } => {
             let e = entries[*entry_idx];
-            let check = if selected_urls.contains(&e.url) { "[x]" } else { "[ ]" };
+            let check = if selected_urls.contains(&e.url) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             let mut spans: Vec<Span<'static>> = vec![
                 Span::raw("  ".repeat(*depth)),
                 Span::styled(check.to_string(), Style::default().fg(TuiColor::Yellow)),
@@ -364,7 +395,10 @@ fn make_list_item(
             }
             spans.push(Span::raw(e.name.clone()));
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(e.size_human(), Style::default().fg(TuiColor::Rgb(80, 180, 80))));
+            spans.push(Span::styled(
+                e.size_human(),
+                Style::default().fg(TuiColor::Rgb(80, 180, 80)),
+            ));
             ListItem::new(Line::from(spans))
         }
     }
@@ -493,12 +527,16 @@ fn tui_select_loop(
                     KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if let Some(i) = list_state.selected() {
-                            if i > 0 { list_state.select(Some(i - 1)); }
+                            if i > 0 {
+                                list_state.select(Some(i - 1));
+                            }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if let Some(i) = list_state.selected() {
-                            if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                            if i + 1 < visible.len() {
+                                list_state.select(Some(i + 1));
+                            }
                         }
                     }
                     KeyCode::PageUp => {
@@ -515,8 +553,12 @@ fn tui_select_loop(
                         if let Some(i) = list_state.selected() {
                             if let Some(VisibleRow::Entry { entry_idx, .. }) = visible.get(i) {
                                 let url = entries[*entry_idx].url.clone();
-                                if !selected_urls.remove(&url) { selected_urls.insert(url); }
-                                if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                                if !selected_urls.remove(&url) {
+                                    selected_urls.insert(url);
+                                }
+                                if i + 1 < visible.len() {
+                                    list_state.select(Some(i + 1));
+                                }
                             }
                         }
                     }
@@ -538,12 +580,16 @@ fn tui_select_loop(
                     KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if let Some(i) = list_state.selected() {
-                            if i > 0 { list_state.select(Some(i - 1)); }
+                            if i > 0 {
+                                list_state.select(Some(i - 1));
+                            }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if let Some(i) = list_state.selected() {
-                            if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                            if i + 1 < visible.len() {
+                                list_state.select(Some(i + 1));
+                            }
                         }
                     }
                     KeyCode::PageUp => {
@@ -575,7 +621,11 @@ fn tui_select_loop(
                     KeyCode::Char(' ') => {
                         if let Some(i) = list_state.selected() {
                             match visible.get(i) {
-                                Some(VisibleRow::Category { full_path, expanded: is_exp, .. }) => {
+                                Some(VisibleRow::Category {
+                                    full_path,
+                                    expanded: is_exp,
+                                    ..
+                                }) => {
                                     if *is_exp {
                                         expanded.remove(full_path.as_str());
                                     } else {
@@ -584,8 +634,12 @@ fn tui_select_loop(
                                 }
                                 Some(VisibleRow::Entry { entry_idx, .. }) => {
                                     let url = entries[*entry_idx].url.clone();
-                                    if !selected_urls.remove(&url) { selected_urls.insert(url); }
-                                    if i + 1 < visible.len() { list_state.select(Some(i + 1)); }
+                                    if !selected_urls.remove(&url) {
+                                        selected_urls.insert(url);
+                                    }
+                                    if i + 1 < visible.len() {
+                                        list_state.select(Some(i + 1));
+                                    }
                                 }
                                 None => {}
                             }
@@ -605,9 +659,13 @@ fn tui_select_loop(
                             .collect();
                         let all = visible_urls.iter().all(|u| selected_urls.contains(u));
                         if all {
-                            for u in &visible_urls { selected_urls.remove(u); }
+                            for u in &visible_urls {
+                                selected_urls.remove(u);
+                            }
                         } else {
-                            for u in visible_urls { selected_urls.insert(u); }
+                            for u in visible_urls {
+                                selected_urls.insert(u);
+                            }
                         }
                     }
                     _ => {}
@@ -636,7 +694,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 RegistryAction::List { query } => {
                     if reg.is_stale() {
-                        eprintln!("Registry is empty. Run `yadict registry refresh` to build the index.");
+                        eprintln!(
+                            "Registry is empty. Run `yadict registry refresh` to build the index."
+                        );
                         return Ok(());
                     }
                     let entries: Vec<_> = match &query {
@@ -654,7 +714,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 RegistryAction::Search { query } => {
                     if reg.is_stale() {
-                        eprintln!("Registry is empty. Run `yadict registry refresh` to build the index.");
+                        eprintln!(
+                            "Registry is empty. Run `yadict registry refresh` to build the index."
+                        );
                         return Ok(());
                     }
                     let entries = reg.search(&query);
@@ -662,11 +724,25 @@ fn main() -> anyhow::Result<()> {
                         println!("No dictionaries found.");
                     } else {
                         for e in &entries {
-                            print!("{}", SetForegroundColor(Color::Rgb { r: 100, g: 100, b: 120 }));
+                            print!(
+                                "{}",
+                                SetForegroundColor(Color::Rgb {
+                                    r: 100,
+                                    g: 100,
+                                    b: 120
+                                })
+                            );
                             print!("[{}]", e.category);
                             print!("{}", ResetColor);
                             print!(" {}", e.name);
-                            print!("{}", SetForegroundColor(Color::Rgb { r: 80, g: 180, b: 80 }));
+                            print!(
+                                "{}",
+                                SetForegroundColor(Color::Rgb {
+                                    r: 80,
+                                    g: 180,
+                                    b: 80
+                                })
+                            );
                             println!("  {}", e.size_human());
                             print!("{}", ResetColor);
                         }
@@ -723,16 +799,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
                 for record in mdx.lookup(&word) {
-                    if let Some(bytes) = record.value() {
-                        let value = String::from_utf8_lossy(bytes);
-                        let output = if markdown {
-                            html2text::from_read(value.as_bytes(), 80)
-                                .unwrap_or_else(|_| value.into_owned())
-                        } else {
-                            default_render.render(value)?
-                        };
-                        results.push(output);
-                    }
+                    let value = record.value();
+                    let output = if markdown {
+                        html2text::from_read(value.as_bytes(), 80)
+                            .unwrap_or_else(|_| value.to_string())
+                    } else {
+                        default_render.render(value)?
+                    };
+                    results.push(output);
                 }
             }
 

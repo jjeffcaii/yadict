@@ -1,5 +1,6 @@
 use super::parser::{BlockEntryInfo, KeyBlock, KeyEntry, record_block_parser};
 use crate::lang::compare as icu_compare;
+use encoding::{Encoding, all::UTF_16LE, label::encoding_from_whatwg_label};
 use memmap2::Mmap;
 use nom::{IResult, bytes::complete::take_till};
 use std::cell::OnceCell;
@@ -18,21 +19,31 @@ pub struct Record<'a> {
     key: &'a [u8],
     mdx: &'a Mdx,
     entry_offset: usize,
-    cache: OnceCell<Option<Vec<u8>>>,
+    key_cache: OnceCell<String>,
+    cache: OnceCell<String>,
 }
 
 impl<'a> Record<'a> {
-    pub fn key(&self) -> &[u8] {
-        self.key
+    pub fn key(&self) -> &str {
+        self.key_cache
+            .get_or_init(|| {
+                crate::lang::decode(&self.mdx.encoding, self.key).expect("failed to decode key")
+            })
+            .as_ref()
     }
 
     /// Lazily decompresses and returns the raw definition bytes.
     /// Returns `None` when no record block covers this entry's offset.
     /// The result is cached; repeated calls are free.
-    pub fn value(&self) -> Option<&[u8]> {
+    pub fn value(&self) -> &str {
         self.cache
-            .get_or_init(|| self.mdx.fetch_definition(self.entry_offset))
-            .as_deref()
+            .get_or_init(|| match self.mdx.fetch_definition(self.entry_offset) {
+                Some(b) => {
+                    crate::lang::decode(&self.mdx.encoding, &b).expect("failed to decode value")
+                }
+                None => String::new(),
+            })
+            .as_ref()
     }
 }
 
@@ -45,18 +56,6 @@ pub struct Mdx {
     pub encrypted: u8,
 }
 
-impl Display for Mdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for next in &self.key_blocks {
-            let first = next.first_key().map(|b| String::from_utf8_lossy(b));
-            let last = next.last_key().map(|b| String::from_utf8_lossy(b));
-            write!(f, "{:?}~{:?}\n", &first, &last)?;
-        }
-
-        Ok(())
-    }
-}
-
 impl Mdx {
     pub fn items(&self) -> impl Iterator<Item = Record<'_>> + '_ {
         self.key_blocks.iter().flat_map(|block| {
@@ -64,6 +63,7 @@ impl Mdx {
                 key: entry.text,
                 mdx: self,
                 entry_offset: entry.offset,
+                key_cache: OnceCell::new(),
                 cache: OnceCell::new(),
             })
         })
@@ -111,34 +111,62 @@ impl Mdx {
             .partition_point(|probe| match probe.last_key() {
                 None => false,
                 Some(b) => {
-                    let end = &String::from_utf8_lossy(b);
-                    let ordering = icu_compare(&end, key);
-                    debug!("probe={}, key={}, result={:?}", &end, key, ordering);
-                    match ordering {
-                        Ordering::Less => true,
-                        _ => false,
+                    if let Ok(end) = crate::lang::decode(key, &b) {
+                        let ordering = icu_compare(&end, key);
+                        debug!("probe={}, key={}, result={:?}", &end, key, ordering);
+                        if Ordering::Less == ordering {
+                            return true;
+                        }
                     }
+                    false
                 }
             });
 
         debug!("pos: {}", pos);
 
-        for idx in [pos.wrapping_sub(1), pos] {
-            if let Some(block) = self.key_blocks.get(idx) {
-                let entries = block.lookup(key);
-                if entries.is_empty() {
-                    continue;
-                }
+        let prev_pos = pos.wrapping_sub(1);
 
-                return entries
+        for idx in [prev_pos, pos] {
+            if let Some(block) = self.key_blocks.get(idx) {
+                let found = block
+                    .lookup(key, &self.encoding)
                     .iter()
                     .map(|entry| Record {
                         key: entry.text,
                         mdx: self,
                         entry_offset: entry.offset,
+                        key_cache: OnceCell::new(),
                         cache: OnceCell::new(),
                     })
-                    .collect();
+                    .collect::<Vec<Record>>();
+
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+        }
+
+        for idx in 0..self.key_blocks.len() {
+            if idx == prev_pos || idx == pos {
+                continue;
+            }
+
+            if let Some(block) = self.key_blocks.get(idx) {
+                let found = block
+                    .lookup(key, &self.encoding)
+                    .iter()
+                    .map(|entry| Record {
+                        key: entry.text,
+                        mdx: self,
+                        entry_offset: entry.offset,
+                        key_cache: OnceCell::new(),
+                        cache: OnceCell::new(),
+                    })
+                    .collect::<Vec<Record>>();
+
+                if !found.is_empty() {
+                    return found;
+                }
             }
         }
 

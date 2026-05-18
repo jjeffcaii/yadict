@@ -1,7 +1,7 @@
 use anyhow::Result;
 use comrak::{
-    nodes::{AstNode, ListType, NodeValue},
     Arena, Options,
+    nodes::{AstNode, ListType, NodeValue},
 };
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use regex::Regex;
@@ -16,8 +16,7 @@ pub struct DefaultRender;
 
 // Matches " N." (space + digits + dot). The caller filters out decimals like " 1.5"
 // by checking that the byte after the dot is not a digit.
-static INLINE_NUM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r" \d+\.").unwrap());
+static INLINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" \d+\.").unwrap());
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
@@ -123,8 +122,14 @@ fn normalize_lists(md: &str) -> String {
 fn is_numbered_md_item(s: &str) -> bool {
     let n = s.bytes().take_while(|b| b.is_ascii_digit()).count();
     n > 0
-        && s.as_bytes().get(n).copied().map_or(false, |b| b == b'.' || b == b')')
-        && s.as_bytes().get(n + 1).copied().map_or(false, |b| b == b' ')
+        && s.as_bytes()
+            .get(n)
+            .copied()
+            .map_or(false, |b| b == b'.' || b == b')')
+        && s.as_bytes()
+            .get(n + 1)
+            .copied()
+            .map_or(false, |b| b == b' ')
 }
 
 // ── AST renderer ─────────────────────────────────────────────────────────────
@@ -288,8 +293,8 @@ fn render_list_item<'a>(node: &'a AstNode<'a>, out: &mut String, ordered: bool, 
     out.push(' ');
 
     let children: Vec<_> = node.children().collect();
-    let tight = children.len() == 1
-        && matches!(children[0].data.borrow().value, NodeValue::Paragraph);
+    let tight =
+        children.len() == 1 && matches!(children[0].data.borrow().value, NodeValue::Paragraph);
 
     if tight {
         // Render paragraph content inline without the paragraph's own trailing newline.

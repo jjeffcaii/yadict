@@ -63,7 +63,10 @@ impl MdictOrgRegistry {
     pub fn new(home_dir: &std::path::Path) -> Self {
         let cache_path = home_dir.join("registry.json");
         let entries = Self::load_cache(&cache_path).unwrap_or_default();
-        Self { entries, cache_path }
+        Self {
+            entries,
+            cache_path,
+        }
     }
 
     fn load_cache(path: &std::path::Path) -> Option<Vec<DictEntry>> {
@@ -90,8 +93,7 @@ impl Registry for MdictOrgRegistry {
         self.entries
             .iter()
             .filter(|e| {
-                e.name.to_lowercase().contains(&q)
-                    || e.category.to_lowercase().contains(&q)
+                e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
             })
             .collect()
     }

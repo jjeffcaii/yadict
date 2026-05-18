@@ -7,11 +7,9 @@ use std::sync::LazyLock;
 static ROW_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?s)<tr class="file">(.*?)</tr>"#).unwrap());
 // Match the href inside a file/dir row. Only relative links (starting with "./").
-static HREF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"href="(\./[^"?#]+)""#).unwrap());
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(\./[^"?#]+)""#).unwrap());
 // Match the data-order size attribute (-1 for directories, positive bytes for files).
-static SIZE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"data-order="(-?\d+)""#).unwrap());
+static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-order="(-?\d+)""#).unwrap());
 
 const MAX_DEPTH: usize = 10;
 // Polite crawl delay between directory requests (ms).
@@ -23,12 +21,7 @@ pub fn crawl(base_url: &str) -> Result<Vec<DictEntry>> {
     Ok(entries)
 }
 
-fn crawl_dir(
-    base_url: &str,
-    path: &str,
-    entries: &mut Vec<DictEntry>,
-    depth: usize,
-) -> Result<()> {
+fn crawl_dir(base_url: &str, path: &str, entries: &mut Vec<DictEntry>, depth: usize) -> Result<()> {
     if depth > MAX_DEPTH {
         return Ok(());
     }

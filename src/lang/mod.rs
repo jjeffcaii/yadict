@@ -1,3 +1,5 @@
+use anyhow::Result;
+use encoding::label::encoding_from_whatwg_label;
 use icu::collator::{Collator, CollatorOptions};
 use icu::locid::Locale;
 use log::__private_api::loc;
@@ -32,6 +34,14 @@ pub fn compare(a: &str, b: &str) -> Ordering {
     let locale = detect_locale_from_text(a);
     let collator = Collator::try_new(&locale.into(), CollatorOptions::new()).unwrap();
     collator.compare(a, b)
+}
+
+pub fn decode(encoding: &str, raw: &[u8]) -> Result<String> {
+    let decoder = encoding_from_whatwg_label(encoding)
+        .ok_or_else(|| anyhow!("unknown encoding '{}'", encoding))?;
+    decoder
+        .decode(raw, encoding::DecoderTrap::Ignore)
+        .map_err(|e| anyhow!("decode error: {}", e))
 }
 
 #[cfg(test)]

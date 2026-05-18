@@ -11,7 +11,6 @@ extern crate anyhow;
 #[macro_use]
 extern crate log;
 
-pub mod dicts;
 pub mod lang;
 pub mod parser;
 pub mod registry;

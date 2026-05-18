@@ -29,6 +29,10 @@ enum Commands {
     Translate {
         /// Word to look up
         word: String,
+
+        /// Print raw Markdown instead of rendered terminal output
+        #[arg(long)]
+        markdown: bool,
     },
 
     /// Download a remote .mdx dictionary to ~/.yadict/mdicts/
@@ -215,7 +219,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Translate { word } => {
+        Commands::Translate { word, markdown } => {
             let mdicts_dir = yadict_home()?.join("mdicts");
 
             let mut paths: Vec<PathBuf> = std::fs::read_dir(&mdicts_dir)
@@ -248,7 +252,13 @@ fn main() -> anyhow::Result<()> {
                 for record in mdx.lookup(&word) {
                     if let Some(bytes) = record.value() {
                         let value = String::from_utf8_lossy(bytes);
-                        results.push(default_render.render(value)?);
+                        let output = if markdown {
+                            html2text::from_read(value.as_bytes(), 80)
+                                .unwrap_or_else(|_| value.into_owned())
+                        } else {
+                            default_render.render(value)?
+                        };
+                        results.push(output);
                     }
                 }
             }

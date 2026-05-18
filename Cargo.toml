@@ -20,7 +20,8 @@ clap = { version = "4.6", features = ["derive"] }
 minilzo-rs = "0.6"
 html2text = "0.17"
 ureq = { version = "2.12", features = ["tls"] }
-termimad = "0.34"
+crossterm = "0.28"
+comrak = "0.52"
 icu = { version = "1.5", features = ["compiled_data"] }
 whatlang = "0.18" # 极其轻量、高效的语言检测库
 once_cell = "1.21"

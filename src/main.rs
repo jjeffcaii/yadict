@@ -27,7 +27,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use yadict::parser;
-use yadict::registry::{DictEntry, MdictOrgRegistry, Registry};
+use yadict::registry::{DictEntry, LocalRegistry, Registry};
 use yadict::render::{DefaultRender, Render};
 
 #[derive(Parser)]
@@ -67,17 +67,23 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum RegistryAction {
-    /// List available dictionaries, optionally filtered by a search term
+    /// List available dictionaries with a browsable TUI, optionally pre-filtered
     List {
-        /// Case-insensitive substring to filter by name or category
+        /// Case-insensitive substring to pre-filter by name or category
         query: Option<String>,
     },
 
-    /// Search dictionaries by name or category
+    /// Search dictionaries by name, category, or registry name (plain output)
     Search { query: String },
 
-    /// Re-crawl mdx.mdict.org and rebuild the local index cache
+    /// Reload all entries from installed registry YAML files
     Refresh,
+
+    /// Install a registry from a local YAML file or HTTP(S) URL
+    Add {
+        /// Local file path or HTTP(S) URL to a registry YAML
+        src: String,
+    },
 }
 
 /// URL-keyed disk cache. Index is stored in `~/.yadict/cache.tsv` (tab-separated: url\tabsolute_path).
@@ -687,15 +693,20 @@ fn main() -> anyhow::Result<()> {
             download_to_cache(&url)?;
         }
         Commands::Registry { action } => {
-            let mut reg = MdictOrgRegistry::new(&yadict_home()?);
+            let home = yadict_home()?;
             match action {
+                RegistryAction::Add { src } => {
+                    LocalRegistry::install(&src, &home)?;
+                }
                 RegistryAction::Refresh => {
+                    let mut reg = LocalRegistry::new(&home);
                     reg.refresh()?;
                 }
                 RegistryAction::List { query } => {
+                    let reg = LocalRegistry::new(&home);
                     if reg.is_stale() {
                         eprintln!(
-                            "Registry is empty. Run `yadict registry refresh` to build the index."
+                            "No registries installed. Use `yadict registry add <path>` to install one."
                         );
                         return Ok(());
                     }
@@ -713,9 +724,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 RegistryAction::Search { query } => {
+                    let reg = LocalRegistry::new(&home);
                     if reg.is_stale() {
                         eprintln!(
-                            "Registry is empty. Run `yadict registry refresh` to build the index."
+                            "No registries installed. Use `yadict registry add <path>` to install one."
                         );
                         return Ok(());
                     }
@@ -724,26 +736,12 @@ fn main() -> anyhow::Result<()> {
                         println!("No dictionaries found.");
                     } else {
                         for e in &entries {
-                            print!(
-                                "{}",
-                                SetForegroundColor(Color::Rgb {
-                                    r: 100,
-                                    g: 100,
-                                    b: 120
-                                })
-                            );
+                            print!("{}", SetForegroundColor(Color::Rgb { r: 100, g: 100, b: 120 }));
                             print!("[{}]", e.category);
                             print!("{}", ResetColor);
                             print!(" {}", e.name);
-                            print!(
-                                "{}",
-                                SetForegroundColor(Color::Rgb {
-                                    r: 80,
-                                    g: 180,
-                                    b: 80
-                                })
-                            );
-                            println!("  {}", e.size_human());
+                            print!("{}", SetForegroundColor(Color::Rgb { r: 80, g: 180, b: 80 }));
+                            println!("  ({})", e.registry);
                             print!("{}", ResetColor);
                         }
                         println!("\n{} dictionaries found.", entries.len());

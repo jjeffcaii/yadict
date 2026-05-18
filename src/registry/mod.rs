@@ -1,27 +1,25 @@
-mod crawler;
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub const BASE_URL: &str = "https://mdx.mdict.org";
-
-// ── Data types ────────────────────────────────────────────────────────────────
+// ── Public data types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DictEntry {
-    /// Display name: decoded filename without the `.mdx` extension.
+    /// Display name of the dictionary.
     pub name: String,
-    /// Direct download URL (URL-encoded, ready to pass to ureq or `yadict add`).
+    /// Direct download URL of the `.mdx` file.
     pub url: String,
-    /// File size in bytes.
+    /// File size in bytes (0 = unknown).
     pub size: u64,
-    /// Human-readable category derived from the directory path (decoded).
+    /// Category path, segments joined with " / ".
     pub category: String,
+    /// Name of the registry this entry came from.
+    pub registry: String,
 }
 
 impl DictEntry {
-    /// Returns a compact human-readable file-size string (KiB / MiB / GiB).
+    /// Returns a compact human-readable file-size string, or "?" when unknown.
     pub fn size_human(&self) -> String {
         const KIB: u64 = 1024;
         const MIB: u64 = 1024 * KIB;
@@ -38,52 +36,129 @@ impl DictEntry {
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 pub trait Registry {
-    /// All indexed entries.
     fn entries(&self) -> &[DictEntry];
-
-    /// Case-insensitive substring search over name and category.
     fn search(&self, query: &str) -> Vec<&DictEntry>;
-
-    /// Re-crawl the remote index and persist the result.
+    /// Reload all entries from installed registry files.
     fn refresh(&mut self) -> Result<()>;
-
-    /// True when the local cache is empty (never fetched or cleared).
+    /// True when no registries are installed.
     fn is_stale(&self) -> bool;
 }
 
-// ── Default implementation: mdx.mdict.org ────────────────────────────────────
+// ── YAML file schema ──────────────────────────────────────────────────────────
 
-pub struct MdictOrgRegistry {
-    entries: Vec<DictEntry>,
-    cache_path: PathBuf,
+#[derive(Debug, Deserialize)]
+struct YamlMeta {
+    name: String,
+    #[allow(dead_code)]
+    url: Option<String>,
 }
 
-impl MdictOrgRegistry {
-    /// Load from cache if available; otherwise start empty (call `refresh`).
-    pub fn new(home_dir: &std::path::Path) -> Self {
-        let cache_path = home_dir.join("registry.json");
-        let entries = Self::load_cache(&cache_path).unwrap_or_default();
-        Self {
-            entries,
-            cache_path,
-        }
+#[derive(Debug, Deserialize)]
+struct YamlResource {
+    name: String,
+    #[serde(default)]
+    category: Vec<String>,
+    mdx: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlFile {
+    metadata: YamlMeta,
+    resources: Vec<YamlResource>,
+}
+
+// ── LocalRegistry ─────────────────────────────────────────────────────────────
+
+/// Reads all `.yaml` / `.yml` registry files from `~/.yadict/registries/`.
+///
+/// Registry format: see `registry.yaml` in the project root.
+pub struct LocalRegistry {
+    entries: Vec<DictEntry>,
+    dir: PathBuf,
+}
+
+impl LocalRegistry {
+    /// Load all installed registries from `<home>/registries/`.
+    pub fn new(home_dir: &Path) -> Self {
+        let dir = home_dir.join("registries");
+        let entries = Self::load_dir(&dir).unwrap_or_default();
+        Self { entries, dir }
     }
 
-    fn load_cache(path: &std::path::Path) -> Option<Vec<DictEntry>> {
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
+    /// Install a registry YAML from a local file path or HTTP(S) URL.
+    /// The file is saved to `<home>/registries/<registry_name>.yaml`.
+    /// Installing a registry with an existing name overwrites the previous file.
+    pub fn install(src: &str, home_dir: &Path) -> Result<()> {
+        let content = if src.starts_with("https://") || src.starts_with("http://") {
+            eprintln!("Downloading registry from {} ...", src);
+            ureq::get(src)
+                .call()
+                .map_err(|e| anyhow!("Download failed: {e}"))?
+                .into_string()?
+        } else {
+            std::fs::read_to_string(src)?
+        };
 
-    fn save_cache(&self) -> Result<()> {
-        if let Some(parent) = self.cache_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.cache_path, serde_json::to_string(&self.entries)?)?;
+        let yaml: YamlFile = serde_yaml::from_str(&content)
+            .map_err(|e| anyhow!("Invalid registry YAML: {e}"))?;
+
+        let dir = home_dir.join("registries");
+        std::fs::create_dir_all(&dir)?;
+        let dest = dir.join(format!("{}.yaml", yaml.metadata.name));
+        std::fs::write(&dest, &content)?;
+
+        eprintln!(
+            "Registry '{}' installed ({} dicts) → {}",
+            yaml.metadata.name,
+            yaml.resources.len(),
+            dest.display()
+        );
         Ok(())
     }
+
+    fn load_dir(dir: &Path) -> Result<Vec<DictEntry>> {
+        let mut entries = Vec::new();
+        if !dir.exists() {
+            return Ok(entries);
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext == "yaml" || ext == "yml")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            match Self::load_file(&path) {
+                Ok(e) => entries.extend(e),
+                Err(err) => eprintln!("Warning: skipping {}: {err}", path.display()),
+            }
+        }
+        Ok(entries)
+    }
+
+    fn load_file(path: &Path) -> Result<Vec<DictEntry>> {
+        let content = std::fs::read_to_string(path)?;
+        let yaml: YamlFile = serde_yaml::from_str(&content)
+            .map_err(|e| anyhow!("Parse error in {}: {e}", path.display()))?;
+        let registry = yaml.metadata.name.clone();
+        Ok(yaml
+            .resources
+            .into_iter()
+            .map(|r| DictEntry {
+                name: r.name,
+                url: r.mdx,
+                size: 0,
+                category: r.category.join(" / "),
+                registry: registry.clone(),
+            })
+            .collect())
+    }
 }
 
-impl Registry for MdictOrgRegistry {
+impl Registry for LocalRegistry {
     fn entries(&self) -> &[DictEntry] {
         &self.entries
     }
@@ -93,22 +168,17 @@ impl Registry for MdictOrgRegistry {
         self.entries
             .iter()
             .filter(|e| {
-                e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q)
+                e.name.to_lowercase().contains(&q)
+                    || e.category.to_lowercase().contains(&q)
+                    || e.registry.to_lowercase().contains(&q)
             })
             .collect()
     }
 
     fn refresh(&mut self) -> Result<()> {
-        eprintln!("Fetching dictionary index from {} ...", BASE_URL);
-        let mut entries = crawler::crawl(BASE_URL)?;
-
-        // Deduplicate by URL (the site may expose the same file in multiple paths).
-        entries.sort_by(|a, b| a.url.cmp(&b.url));
-        entries.dedup_by(|a, b| a.url == b.url);
-
-        self.entries = entries;
-        eprintln!("Indexed {} dictionaries.", self.entries.len());
-        self.save_cache()
+        self.entries = Self::load_dir(&self.dir).unwrap_or_default();
+        eprintln!("Reloaded {} entries from registries.", self.entries.len());
+        Ok(())
     }
 
     fn is_stale(&self) -> bool {

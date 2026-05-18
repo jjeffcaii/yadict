@@ -86,7 +86,7 @@ fn crawl_dir(base_url: &str, path: &str, entries: &mut Vec<DictEntry>, depth: us
 fn path_to_category(path: &str) -> String {
     path.split('/')
         .filter(|s| !s.is_empty())
-        .map(|s| percent_decode(s))
+        .map(percent_decode)
         .collect::<Vec<_>>()
         .join(" / ")
 }

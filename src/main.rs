@@ -161,7 +161,7 @@ fn resolve_filename(url: &str, resp: &ureq::Response) -> anyhow::Result<String> 
 
     let raw = url
         .split('/')
-        .last()
+        .next_back()
         .and_then(|s| s.split('?').next())
         .and_then(|s| s.split('#').next())
         .filter(|s| !s.is_empty())
@@ -678,7 +678,7 @@ fn tui_select_loop(
 fn main() -> anyhow::Result<()> {
     env_logger::try_init().ok();
 
-    let default_render = DefaultRender::default();
+    let default_render = DefaultRender;
 
     let cli = Cli::parse();
 
@@ -757,7 +757,7 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow!("Cannot read {}: {e}", mdicts_dir.display()))?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |ext| ext == "mdx"))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "mdx"))
                 .collect();
             paths.sort();
             if paths.is_empty() {
@@ -775,7 +775,7 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow!("Cannot read {}: {e}", mdicts_dir.display()))?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |ext| ext == "mdx"))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "mdx"))
                 .collect();
             paths.sort();
 

@@ -111,7 +111,7 @@ impl Mdx {
             .partition_point(|probe| match probe.last_key() {
                 None => false,
                 Some(b) => {
-                    if let Ok(end) = crate::lang::decode(key, &b) {
+                    if let Ok(end) = crate::lang::decode(key, b) {
                         let ordering = icu_compare(&end, key);
                         debug!("probe={}, key={}, result={:?}", &end, key, ordering);
                         if Ordering::Less == ordering {

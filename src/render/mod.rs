@@ -47,7 +47,7 @@ fn split_inline_numbered(para: &str) -> Option<Vec<&str>> {
             !s.as_bytes()
                 .get(m.end())
                 .copied()
-                .map_or(false, |b| b.is_ascii_digit())
+                .is_some_and(|b| b.is_ascii_digit())
         })
         .map(|m| m.start())
         .collect();
@@ -125,11 +125,8 @@ fn is_numbered_md_item(s: &str) -> bool {
         && s.as_bytes()
             .get(n)
             .copied()
-            .map_or(false, |b| b == b'.' || b == b')')
-        && s.as_bytes()
-            .get(n + 1)
-            .copied()
-            .map_or(false, |b| b == b' ')
+            .is_some_and(|b| b == b'.' || b == b')')
+        && s.as_bytes().get(n + 1).copied() == Some(b' ')
 }
 
 // ── AST renderer ─────────────────────────────────────────────────────────────

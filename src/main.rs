@@ -241,32 +241,47 @@ fn download_files(entries: &[&DictEntry], home: &std::path::Path) -> anyhow::Res
     Ok(())
 }
 
-/// Fetch a URL and write the body directly to `dest`, reporting progress via `pb`.
+/// Fetch a URL into a `.part` temp file beside `dest`, then rename on success.
+/// The destination never contains a partial download; the temp file is cleaned
+/// up automatically if the download fails.
 fn fetch_file(
     url: &str,
     dest: &std::path::Path,
     client: &reqwest::blocking::Client,
     pb: &ProgressBar,
 ) -> anyhow::Result<()> {
-    let mut resp = client
-        .get(url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| anyhow!("Request failed: {e}"))?;
-    if let Some(len) = resp.content_length() {
-        pb.set_length(len);
-    }
-    let mut file = std::fs::File::create(dest)?;
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = resp.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let mut tmp_name = dest.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".part");
+    let tmp = dest.with_file_name(tmp_name);
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut resp = client
+            .get(url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| anyhow!("Request failed: {e}"))?;
+        if let Some(len) = resp.content_length() {
+            pb.set_length(len);
         }
-        file.write_all(&buf[..n])?;
-        pb.inc(n as u64);
+        let mut file = std::fs::File::create(&tmp)?;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = resp.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            pb.inc(n as u64);
+        }
+        drop(file);
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 /// Find all `.mdx` files under `<home>/registry/<registry_name>/`.

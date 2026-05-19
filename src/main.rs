@@ -10,7 +10,9 @@ extern crate anyhow;
 #[macro_use]
 extern crate log;
 
-use std::{collections::HashSet, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::HashSet, io::{Read, Write}, path::PathBuf, sync::{Arc, Mutex}};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -24,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color as TuiColor, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use yadict::parser;
 use yadict::registry::{DictEntry, LocalRegistry, Registry};
@@ -48,6 +50,10 @@ enum Commands {
         #[arg(long)]
         markdown: bool,
 
+        /// Print raw HTML instead of rendered terminal output
+        #[arg(long)]
+        html: bool,
+
         /// Registry name to query (scans ~/.yadict/registry/<name>/)
         #[arg(short = 'r', long = "registry", default_value = "default")]
         registry: String,
@@ -56,6 +62,16 @@ enum Commands {
     /// List all installed dictionaries in ~/.yadict/registry/<name>/
     List {
         /// Registry name to list (scans ~/.yadict/registry/<name>/)
+        #[arg(short = 'r', long = "registry", default_value = "default")]
+        registry: String,
+    },
+
+    /// Remove an installed dictionary from ~/.yadict/registry/<registry>/
+    Remove {
+        /// Dictionary name to remove (filename without .mdx extension)
+        name: String,
+
+        /// Registry name (scans ~/.yadict/registry/<name>/)
         #[arg(short = 'r', long = "registry", default_value = "default")]
         registry: String,
     },
@@ -124,10 +140,33 @@ impl CacheStore {
         writeln!(f, "{}\t{}", url, path.display())?;
         Ok(())
     }
+
+    /// Remove all cache entries whose stored path matches `path`.
+    fn remove_by_path(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let content = match std::fs::read_to_string(&self.index_path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                line.split_once('\t')
+                    .map(|(_, p)| PathBuf::from(p) != path)
+                    .unwrap_or(true)
+            })
+            .collect();
+        let out = if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", kept.join("\n"))
+        };
+        std::fs::write(&self.index_path, out)?;
+        Ok(())
+    }
 }
 
 /// Download selected entries into `<home>/registry/<registry>/<name>.mdx` in parallel.
-/// Already-cached files are skipped. Errors are printed per-file; other downloads continue.
+/// Already-cached files are skipped. Errors are reported via the progress bar.
 fn download_files(entries: &[&DictEntry], home: &std::path::Path) -> anyhow::Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -140,37 +179,55 @@ fn download_files(entries: &[&DictEntry], home: &std::path::Path) -> anyhow::Res
             .build()?,
     );
 
+    let mp = Arc::new(MultiProgress::new());
+    let sty = ProgressStyle::with_template(
+        " {spinner:.cyan} {msg:<40} [{bar:38.cyan/white}] {bytes:>10}/{total_bytes:<10}  {bytes_per_sec:>12}  eta {eta}",
+    )
+    .unwrap()
+    .progress_chars("█▓░")
+    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ");
+
     std::thread::scope(|s| {
         let handles: Vec<_> = entries
             .iter()
             .map(|entry| {
                 let store = Arc::clone(&store);
                 let client = Arc::clone(&client);
+                let mp = Arc::clone(&mp);
+                let sty = sty.clone();
                 let url = entry.url.clone();
+                let name = entry.name.clone();
                 let dest = home
                     .join("registry")
                     .join(&entry.registry)
                     .join(format!("{}.mdx", entry.name));
                 s.spawn(move || {
+                    let pb = mp.add(ProgressBar::new(0));
+                    pb.set_style(sty);
+                    pb.set_message(name.clone());
+                    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
                     if let Some(cached) = store.lock().unwrap().lookup(&url) {
                         debug!("using cached file: {}", cached.display());
+                        pb.finish_with_message(format!("{name}  (already installed)"));
                         return;
                     }
                     if let Some(parent) = dest.parent() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!("Error creating {}: {e}", parent.display());
+                            pb.abandon_with_message(format!("{name}  ✗ {e}"));
                             return;
                         }
                     }
-                    eprintln!("Downloading {} ...", url);
-                    match fetch_file(&url, &dest, &client) {
+                    match fetch_file(&url, &dest, &client, &pb) {
                         Ok(()) => {
                             if let Err(e) = store.lock().unwrap().insert(&url, &dest) {
-                                eprintln!("Warning: failed to record cache entry: {e}");
+                                pb.println(format!("Warning: failed to record cache entry: {e}"));
                             }
-                            eprintln!("Saved to {}", dest.display());
+                            pb.finish_with_message(format!("{name}  ✓"));
                         }
-                        Err(e) => eprintln!("Error downloading {url}: {e}"),
+                        Err(e) => {
+                            pb.abandon_with_message(format!("{name}  ✗ {e}"));
+                        }
                     }
                 })
             })
@@ -182,19 +239,31 @@ fn download_files(entries: &[&DictEntry], home: &std::path::Path) -> anyhow::Res
     Ok(())
 }
 
-/// Fetch a URL and write the body directly to `dest`.
+/// Fetch a URL and write the body directly to `dest`, reporting progress via `pb`.
 fn fetch_file(
     url: &str,
     dest: &std::path::Path,
     client: &reqwest::blocking::Client,
+    pb: &ProgressBar,
 ) -> anyhow::Result<()> {
     let mut resp = client
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| anyhow!("Request failed: {e}"))?;
+    if let Some(len) = resp.content_length() {
+        pb.set_length(len);
+    }
     let mut file = std::fs::File::create(dest)?;
-    std::io::copy(&mut resp, &mut file)?;
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        pb.inc(n as u64);
+    }
     Ok(())
 }
 
@@ -352,6 +421,7 @@ fn make_list_item(
     row: &VisibleRow,
     entries: &[&DictEntry],
     selected_urls: &HashSet<String>,
+    installed: &HashSet<String>,
 ) -> ListItem<'static> {
     match row {
         VisibleRow::Category {
@@ -405,6 +475,12 @@ fn make_list_item(
                 e.size_human(),
                 Style::default().fg(TuiColor::Rgb(80, 180, 80)),
             ));
+            if installed.contains(&e.url) {
+                spans.push(Span::styled(
+                    "  ✓".to_string(),
+                    Style::default().fg(TuiColor::Rgb(80, 220, 140)).add_modifier(Modifier::BOLD),
+                ));
+            }
             ListItem::new(Line::from(spans))
         }
     }
@@ -412,16 +488,137 @@ fn make_list_item(
 
 // ── TUI entry point ───────────────────────────────────────────────────────────
 
-/// Launch the multi-select registry TUI and return URLs chosen by the user.
-/// Restores the terminal before returning, even on error.
-fn run_registry_tui(entries: &[&DictEntry]) -> anyhow::Result<Vec<String>> {
+fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
+/// Show a confirmation popup listing dictionaries to download and/or remove.
+/// Returns true if the user confirms, false if they cancel.
+fn run_confirm_tui(to_download: &[&DictEntry], to_remove: &[&DictEntry]) -> anyhow::Result<bool> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = tui_select_loop(&mut terminal, entries);
+    let result = confirm_loop(&mut terminal, to_download, to_remove);
+
+    disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn confirm_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    to_download: &[&DictEntry],
+    to_remove: &[&DictEntry],
+) -> anyhow::Result<bool> {
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+
+            // Calculate content height: section headers + items + blank separator
+            let mut content_h: u16 = 0;
+            if !to_download.is_empty() {
+                content_h += 1 + to_download.len() as u16;
+            }
+            if !to_remove.is_empty() {
+                if !to_download.is_empty() { content_h += 1; }
+                content_h += 1 + to_remove.len() as u16;
+            }
+            let popup_h = (content_h + 4).min(area.height.saturating_sub(2));
+            let popup_w = 72u16.min(area.width.saturating_sub(4));
+            let popup = centered_rect(popup_w, popup_h, area);
+
+            f.render_widget(Clear, popup);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Confirm changes ")
+                .title_style(Style::default().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD))
+                .style(Style::default().bg(TuiColor::Black));
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(inner);
+
+            let mut items: Vec<ListItem> = Vec::new();
+
+            if !to_download.is_empty() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  Download ({}):", to_download.len()),
+                    Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD),
+                ))));
+                for e in to_download {
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw("    • "),
+                        Span::raw(e.name.clone()),
+                        Span::raw("  "),
+                        Span::styled(e.size_human(), Style::default().fg(TuiColor::Rgb(80, 180, 80))),
+                    ])));
+                }
+            }
+
+            if !to_remove.is_empty() {
+                if !to_download.is_empty() {
+                    items.push(ListItem::new(Line::default()));
+                }
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  Remove ({}):", to_remove.len()),
+                    Style::default().fg(TuiColor::Red).add_modifier(Modifier::BOLD),
+                ))));
+                for e in to_remove {
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::styled("    • ", Style::default().fg(TuiColor::Red)),
+                        Span::styled(e.name.clone(), Style::default().fg(TuiColor::Rgb(255, 100, 100))),
+                    ])));
+                }
+            }
+
+            f.render_widget(List::new(items), chunks[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "  Enter / y: confirm    Esc / n: cancel",
+                    Style::default().fg(TuiColor::DarkGray),
+                )),
+                chunks[1],
+            );
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => return Ok(true),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Launch the multi-select registry TUI.
+/// Returns Some(urls) when the user confirms, None when they cancel (q/Esc).
+/// Restores the terminal before returning, even on error.
+fn run_registry_tui(entries: &[&DictEntry], installed: &HashSet<String>) -> anyhow::Result<Option<Vec<String>>> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = tui_select_loop(&mut terminal, entries, installed);
 
     disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -433,11 +630,12 @@ fn run_registry_tui(entries: &[&DictEntry]) -> anyhow::Result<Vec<String>> {
 fn tui_select_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     entries: &[&DictEntry],
-) -> anyhow::Result<Vec<String>> {
+    installed: &HashSet<String>,
+) -> anyhow::Result<Option<Vec<String>>> {
     let tree = build_category_tree(entries);
     // Expand all top-level nodes by default.
     let mut expanded: HashSet<String> = tree.iter().map(|n| n.full_path.clone()).collect();
-    let mut selected_urls: HashSet<String> = HashSet::new();
+    let mut selected_urls: HashSet<String> = installed.iter().cloned().collect();
     let mut list_state = ListState::default();
     list_state.select(Some(0));
     let mut search_query = String::new();
@@ -494,7 +692,7 @@ fn tui_select_loop(
             );
             let items: Vec<ListItem> = visible
                 .iter()
-                .map(|row| make_list_item(row, entries, &selected_urls))
+                .map(|row| make_list_item(row, entries, &selected_urls, installed))
                 .collect();
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(title))
@@ -530,7 +728,7 @@ fn tui_select_loop(
                         search_query.pop();
                         list_state.select(Some(0));
                     }
-                    KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
+                    KeyCode::Enter => return Ok(Some(selected_urls.into_iter().collect())),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if let Some(i) = list_state.selected() {
                             if i > 0 {
@@ -577,13 +775,13 @@ fn tui_select_loop(
                 }
             } else {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(vec![]),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
                     KeyCode::Char('/') => {
                         search_active = true;
                         search_query.clear();
                         list_state.select(Some(0));
                     }
-                    KeyCode::Enter => return Ok(selected_urls.into_iter().collect()),
+                    KeyCode::Enter => return Ok(Some(selected_urls.into_iter().collect())),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if let Some(i) = list_state.selected() {
                             if i > 0 {
@@ -714,15 +912,47 @@ fn main() -> anyhow::Result<()> {
                     if entries.is_empty() {
                         println!("No dictionaries found.");
                     } else {
-                        let urls = run_registry_tui(&entries)?;
-                        let url_set: std::collections::HashSet<&str> =
-                            urls.iter().map(|s| s.as_str()).collect();
-                        let selected: Vec<&DictEntry> = entries
+                        let installed: HashSet<String> = entries
                             .iter()
-                            .filter(|e| url_set.contains(e.url.as_str()))
+                            .filter(|e| {
+                                home.join("registry")
+                                    .join(&e.registry)
+                                    .join(format!("{}.mdx", e.name))
+                                    .exists()
+                            })
+                            .map(|e| e.url.clone())
+                            .collect();
+                        let Some(urls) = run_registry_tui(&entries, &installed)? else {
+                            return Ok(()); // user cancelled
+                        };
+                        let url_set: HashSet<&str> =
+                            urls.iter().map(|s| s.as_str()).collect();
+                        let to_download: Vec<&DictEntry> = entries
+                            .iter()
+                            .filter(|e| url_set.contains(e.url.as_str()) && !installed.contains(&e.url))
                             .copied()
                             .collect();
-                        download_files(&selected, &home)?;
+                        let to_remove: Vec<&DictEntry> = entries
+                            .iter()
+                            .filter(|e| !url_set.contains(e.url.as_str()) && installed.contains(&e.url))
+                            .copied()
+                            .collect();
+                        if to_download.is_empty() && to_remove.is_empty() {
+                            return Ok(()); // no changes, exit silently
+                        }
+                        if run_confirm_tui(&to_download, &to_remove)? {
+                            for e in &to_remove {
+                                let p = home
+                                    .join("registry")
+                                    .join(&e.registry)
+                                    .join(format!("{}.mdx", e.name));
+                                if p.exists() {
+                                    std::fs::remove_file(&p)?;
+                                    CacheStore::new(&home).remove_by_path(&p)?;
+                                }
+                            }
+                            download_files(&to_download, &home)?;
+                        }
                     }
                 }
                 RegistryAction::Search { query } => {
@@ -751,6 +981,20 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Remove { name, registry } => {
+            let home = yadict_home()?;
+            let path = home
+                .join("registry")
+                .join(&registry)
+                .join(format!("{}.mdx", name));
+            if !path.exists() {
+                eprintln!("Dictionary '{name}' not found in registry '{registry}'.");
+                return Ok(());
+            }
+            std::fs::remove_file(&path)?;
+            CacheStore::new(&home).remove_by_path(&path)?;
+            println!("Removed '{name}' from registry '{registry}'.");
+        }
         Commands::List { registry } => {
             let home = yadict_home()?;
             let paths = find_mdx_files(&home, &registry)?;
@@ -760,11 +1004,11 @@ fn main() -> anyhow::Result<()> {
                 );
             } else {
                 for path in &paths {
-                    println!("{}", path.file_name().unwrap_or_default().to_string_lossy());
+                    println!("{}", path.file_stem().unwrap_or_default().to_string_lossy());
                 }
             }
         }
-        Commands::Translate { word, markdown, registry } => {
+        Commands::Translate { word, markdown, html, registry } => {
             let home = yadict_home()?;
             let paths = find_mdx_files(&home, &registry)?;
 
@@ -788,7 +1032,9 @@ fn main() -> anyhow::Result<()> {
                 };
                 for record in mdx.lookup(&word) {
                     let value = record.value();
-                    let output = if markdown {
+                    let output = if html {
+                        value.to_string()
+                    } else if markdown {
                         html2text::from_read(value.as_bytes(), 80)
                             .unwrap_or_else(|_| value.to_string())
                     } else {

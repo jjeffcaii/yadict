@@ -184,7 +184,7 @@ fn render_node<'a>(node: &'a AstNode<'a>, out: &mut String) {
 
     match info {
         Info::Text(s) => out.push_str(&s),
-        Info::SoftBreak => out.push(' '),
+        Info::SoftBreak => out.push('\n'),
         Info::LineBreak => out.push('\n'),
         Info::Skip => {}
         Info::Children => render_children(node, out),

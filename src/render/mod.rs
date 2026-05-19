@@ -18,6 +18,19 @@ pub struct DefaultRender;
 // by checking that the byte after the dot is not a digit.
 static INLINE_NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" \d+\.").unwrap());
 
+// html2text strips <i>/<em>/<b>/<strong> and outputs plain text.
+// Replace them with ANSI escape codes before html2text runs.
+// Using specific on/off codes (not reset-all) so they don't clobber colors
+// applied by the outer comrak renderer.
+static TAG_STRONG_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<(b|strong)(\s[^>]*)?>").unwrap());
+static TAG_STRONG_CLOSE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)</(b|strong)>").unwrap());
+static TAG_EM_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<(i|em)(\s[^>]*)?>").unwrap());
+static TAG_EM_CLOSE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)</(i|em)>").unwrap());
+
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
 fn fg(r: u8, g: u8, b: u8) -> String {
@@ -306,11 +319,33 @@ fn render_list_item<'a>(node: &'a AstNode<'a>, out: &mut String, ordered: bool, 
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+// Unicode private-use sentinels. html2text passes valid Unicode through but
+// strips \x1b (ESC), so we use these as placeholders and swap them for real
+// ANSI codes after html2text runs but before comrak sees the text.
+const EM_ON: &str = "\u{E000}";
+const EM_OFF: &str = "\u{E001}";
+const STRONG_ON: &str = "\u{E002}";
+const STRONG_OFF: &str = "\u{E003}";
+
 impl Render for DefaultRender {
     fn render(&self, content: impl AsRef<str>) -> Result<String> {
+        // Step 1: tag inline formatting with private-use sentinels.
+        let html = TAG_STRONG_OPEN.replace_all(content.as_ref(), STRONG_ON);
+        let html = TAG_STRONG_CLOSE.replace_all(&html, STRONG_OFF);
+        let html = TAG_EM_OPEN.replace_all(&html, EM_ON);
+        let html = TAG_EM_CLOSE.replace_all(&html, EM_OFF);
+
+        // Step 2: html2text converts HTML structure; sentinels survive.
         // Use a very large width so html2text never wraps mid-paragraph.
-        let md = html2text::from_read(content.as_ref().as_bytes(), 10_000)?;
+        let md = html2text::from_read(html.as_bytes(), 10_000)?;
         let md = normalize_lists(&md);
+
+        // Step 3: swap sentinels for ANSI codes; comrak Text nodes pass them through.
+        let md = md
+            .replace(EM_ON, &atr(Attribute::Italic))
+            .replace(EM_OFF, &atr(Attribute::NoItalic))
+            .replace(STRONG_ON, &atr(Attribute::Bold))
+            .replace(STRONG_OFF, &atr(Attribute::NormalIntensity));
 
         let arena = Arena::new();
         let root = comrak::parse_document(&arena, &md, &Options::default());

@@ -42,6 +42,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Translate a word by querying all dictionaries in ~/.yadict/registry/<name>/
+    #[command(alias = "t")]
     Translate {
         /// Word to look up
         word: String,
@@ -77,6 +78,7 @@ enum Commands {
     },
 
     /// Browse and search the remote dictionary index (mdx.mdict.org)
+    #[command(alias = "r")]
     Registry {
         #[command(subcommand)]
         action: RegistryAction,
